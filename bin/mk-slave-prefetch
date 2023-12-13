@@ -4140,6 +4140,7 @@ use List::Util qw(max sum);
 use Time::HiRes qw(sleep);
 use File::Basename qw(dirname);
 use sigtrap qw(handler finish untrapped normal-signals);
+use File::Spec::Functions 'catfile';
 
 use Data::Dumper;
 $Data::Dumper::Indent    = 1;
@@ -4500,7 +4501,7 @@ sub main {
                sleep 1;
                next EVENT;
             }
-            my $relay_log = "$relay_log_dir/$slave_status->{file}";
+            my $relay_log = catfile("$relay_log_dir", "$slave_status->{file}");
             eval {
                die "File does not exist" unless -f $relay_log;
                $fh = $spf->open_relay_log(
