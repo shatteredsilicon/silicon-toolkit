@@ -4334,7 +4334,13 @@ sub main {
          my $tdbh = $dp->get_dbh($dp->get_cxn_params($dsn), {AutoCommit => 1});
          $tdbh->{InactiveDestroy}  = 1;
          $tdbh->{FetchHashKeyName} = 'NAME_lc';
-         $tdbh->do('/*!40001 SEt @@session.query_cache_type=OFF */');
+         if ( my $have_qcache = $tdbh->selectrow_hashref("SHOW VARIABLES LIKE 'have_query_cache'") ) {
+            if ( grep $_ eq $have_qcache->{value}, @DB_TRUES ) {
+               $sql = '/*!40001 SET @@session.query_cache_type=OFF */';
+               MKDEBUG && _d($dbh, $sql);
+               $tdbh->do($sql);
+            }
+         }
 
          my $curdb = '';
          my $tid    = threads->self()->tid();
