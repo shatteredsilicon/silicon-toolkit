@@ -4154,6 +4154,8 @@ my $sentinel;
 my $run_time;
 my $end;
 
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
 sub main {
    @ARGV = @_;  # set global ARGV for this package
 
@@ -4230,7 +4232,7 @@ sub main {
    my $sql = "SHOW VARIABLES LIKE 'have_query_cache'";
    MKDEBUG && _d($dbh, $sql);
    if ( my $have_qcache = $dbh->selectrow_hashref($sql) ) {
-      if ( $have_qcache->{value} ) {
+      if ( grep $_ eq $have_qcache->{value}, @DB_TRUES ) {
          $sql = '/*!40001 SET @@session.query_cache_type=OFF */';
          MKDEBUG && _d($dbh, $sql);
          $dbh->do($sql);
