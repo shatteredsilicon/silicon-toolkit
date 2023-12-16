@@ -1,0 +1,331 @@
+#!/usr/bin/env perl
+
+# This is st-sideload-relay, a program to sideload relay logs on a MySQL slave.
+#
+# Copyright (C) 2023  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class, $opt_str ) = @_;
+
+  my $initial_prefetch = 2 * 1024 * 1024 * 1024; # default 2G
+  my $io_thread_threshold = 1024 * 1024 * 1024; # default 1G
+
+  my %options = (
+    "initial-prefetch=s" => sub { my ($name, $value) = @_; my $val = parse_size_arg($name, $value); if (defined $val) { $initial_prefetch = $val; } else { pod2usage; } },
+    "io-thread-threshold=s" => sub { my ($name, $value) = @_; my $val = parse_size_arg($name, $value); if (defined $val) { $io_thread_threshold = $val; } else { pod2usage; } },
+    "channel-name|C=s" => \(my $channel_name = ''),
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "tmp-dir=s" => \(my $tmp_dir = '/tmp'),
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+
+  my $self = {
+    args => {
+      'initial-prefetch' => $initial_prefetch,
+      'io-thread-threshold' => $io_thread_threshold,
+      'channel-name' => $channel_name,
+      'user' => $user,
+      'password' => $password,
+      'host' => $host,
+      'socket' => $socket,
+      'port' => $port,
+      'tmp-dir' => $tmp_dir,
+    },
+  };
+
+  if (defined $opt_str) {
+    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              $self->{args}->{$primary_name} = $opt_val;
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    STDEBUG && print $conf_file . "\n";
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file" )) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # read default socket path from output of
+  # 'mysqlbinlog --print-defaults'
+  open FH, "mysqlbinlog --print-defaults |";
+	my @lines = <FH>;
+	close FH;
+
+  foreach my $line (@lines) {
+    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
+      $self->{args}->{socket} = "$path";
+      last;
+    }
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+sub parse_size_arg {
+  my ($name, $value) = @_;
+
+  my %factor_for = (
+    K => 1_024,
+    M => 1_048_576,
+    G => 1_073_741_824,
+    T => 1_099_511_627_776,
+  );
+
+  my ($pre, $num, $factor) = $value =~ m/^([+-])?(\d+)([KMGT])?B?$/;
+  if ( defined $num ) {
+    if ( $factor ) {
+        $num *= $factor_for{$factor};
+    }
+    STDEBUG && print $name . ": " . $num . "\n";
+    return $num * 1;
+  }
+
+  return undef;
+}
+
+# ############################################################################
+# st_sideload_relay program.
+# ############################################################################
+package st_sideload_relay;
+
+sub main {
+  my @ARGV = @_;
+
+  my $o = new Option(shift @ARGV);
+  $o->parse_dsn();
+
+  return 0;
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-sideload-relay - a program to sideload relay logs on a MySQL slave
+
+=head1 SYNOPSIS
+
+Usage: st-sideload-relay [OPTION...] [DSN]
+
+st-sideload-relay sideloads relay logs on a MySQL slave
+
+Example:
+
+  st-sideload-relay
+
+  st-sideload-relay --channel-name=prod
+
+  st-sideload-relay -u mysql -h master1
+
+  st-sideload-relay u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-sideload-relay fetches binlog from master/source and sideloads it while
+stopping the io_thread.
+
+=head1 RISK
+
+This program takes over the work of replication I/O thread. DO NOT run:
+START SLAVE;
+or
+START SLAVE io_tread;
+while this program is running or YOU WILL CORRUPT YOUR REPLICATION STREAM AND YOUR DATA!
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--initial-prefetch>
+
+type: size; default: 2G
+
+The size limit for fetching the initial binlog.
+
+=item B<--io-thread-threshold>
+
+type: size; default: 1G
+
+Keep prefetching the next batch of binlog until Exec_Master_Log_Pos and Master_Log_File
+are this amount of data away from the end of the available relay logs.
+
+=item B<--channel-name>
+
+short form: -c; type: string
+
+The name of the replication channel.
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--tmp-dir>
+
+Directory for storing temporary files.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=cut
