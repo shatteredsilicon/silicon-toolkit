@@ -201,6 +201,113 @@ sub parse_size_arg {
 }
 
 # ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 0,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket});
+  STDEBUG && print 'dsn: ' . $dsn . "\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        STDEBUG && print $EVAL_ERROR;
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/mysql/i ) {
+          die "Cannot connect to MySQL because the Perl DBD::mysql module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql' to see "
+              . "the directories that Perl searches for DBD::mysql.  If "
+              . "DBD::mysql is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Connection info:',      $dbh->{mysql_hostinfo},
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBD::mysql::VERSION:', $DBD::mysql::VERSION,
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn = "DBI:mysql:;port=$port";
+  if ($socket) {
+    $dsn = "${dsn};socket=$socket;";
+  } else {
+    $dsn = "${dsn};host=$host;";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+# ############################################################################
 # st_sideload_relay program.
 # ############################################################################
 package st_sideload_relay;
@@ -211,6 +318,15 @@ sub main {
   my $o = new Option(shift @ARGV);
   $o->parse_dsn();
 
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $o->get_option('password'),
+  );
+
+  $db->disconnect() if $db;
   return 0;
 }
 
