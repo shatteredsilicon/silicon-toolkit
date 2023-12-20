@@ -323,8 +323,10 @@ use warnings FATAL => 'all';
 use English qw(-no_match_vars);
 use Data::Dumper;
 use File::Basename;
-use File::Spec::Functions 'catfile';
+use File::Spec::Functions 'catfile', 'file_name_is_absolute';
 use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @CLI_SSL_TLS_ARGS = ('ssl-ca', 'ssl-capath', 'ssl-cert', 'ssl-cipher', 'ssl-key', 'ssl-crl', 'ssl-crlpath', 'tls-version', 'tls-ciphersuites');
 
 sub main {
   my @ARGV = @_;
@@ -351,6 +353,39 @@ sub main {
   if ($EVAL_ERROR) {
     $db->disconnect() if $db;
     die "Failed to get master info from mysql.slave_master_info for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  my $datadir;
+  eval { $datadir = $db->{dbh}->selectrow_arrayref('SELECT @@datadir')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get datadir for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  STDEBUG && print Dumper($master_info);
+
+  my $mysql_extra_args = '';
+  if ($db->is_true($master_info->{Enabled_ssl})) {
+    $mysql_extra_args = "--ssl-mode=REQUIRED";
+    foreach my $key (keys %{$master_info}) {
+      my $lc_key = lc($key);
+      $lc_key =~ s/_/-/g;
+      if (!(grep $_ eq $lc_key, @CLI_SSL_TLS_ARGS)) {
+        next;
+      }
+
+      my $value = defined $master_info->{$key} ? $master_info->{$key} : '';
+      my $lc_value = lc($value);
+      if ($lc_key eq 'ssl-cert' || $lc_key eq 'ssl-key') {
+        if (!file_name_is_absolute($value)) {
+          $value = catfile($datadir, $value);
+        }
+      }
+
+      if (($lc_key =~ m/^ssl-/ || $lc_key =~ m/^tls-/ ) && ($lc_value ne '' && $lc_value ne 'null')) {
+        $mysql_extra_args = "$mysql_extra_args --$lc_key $value";
+      }
+    }
   }
 
   if (!$master_info) {
@@ -398,10 +433,17 @@ sub main {
       last EVENT;
     }
 
-    # get master binlog list 
-    open ML, "mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null |";
-    my @master_logs_output = <ML>;
-    close ML;
+    STDEBUG && print "fetching master log list with mysql cli args: -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B\n";
+
+    # get master binlog list
+    my @master_logs_output;
+    eval { @master_logs_output = `mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\"` };
+    if ($? ne 0) {
+      warn "Failed to fetch master log list with mysql cli, exit code: $?";
+      last EVENT;
+    }
+
+    STDEBUG && print "@master_logs_output" . "\n";
 
     # walk through binlog list, get those we need to fetch
     my $master_log_pos = $slave_status->{Read_Master_Log_Pos};
