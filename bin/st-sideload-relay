@@ -437,7 +437,7 @@ sub main {
 
     # get master binlog list
     my @master_logs_output;
-    eval { @master_logs_output = `mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\"` };
+    eval { @master_logs_output = `mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null` };
     if ($? ne 0) {
       warn "Failed to fetch master log list with mysql cli, exit code: $?";
       last EVENT;
@@ -460,15 +460,20 @@ sub main {
         $exec_master_log_found = 1;
       }
 
+      my $log_pos = $master_logs_fields[1];
+      if ($db->is_true($master_logs_fields[2])) {
+        $log_pos -= 512;
+      }
+
       if ($exec_master_log_found) {
         if ($slave_status->{Relay_Master_Log_File} eq $slave_status->{Master_Log_File}) {
           $exec_read_pos_offset = $slave_status->{Read_Master_Log_Pos} - $slave_status->{Exec_Master_Log_Pos};
         } elsif ($master_logs_fields[0] eq $slave_status->{Master_Log_File}) {
           $exec_read_pos_offset += $slave_status->{Read_Master_Log_Pos};
         } elsif ($slave_status->{Relay_Master_Log_File} eq $master_logs_fields[0]) {
-          $exec_read_pos_offset += $master_logs_fields[1] - $slave_status->{Exec_Master_Log_Pos};
+          $exec_read_pos_offset += $log_pos - $slave_status->{Exec_Master_Log_Pos};
         } else {
-          $exec_read_pos_offset += $master_logs_fields[1];
+          $exec_read_pos_offset += $log_pos;
         }
       }
 
@@ -476,12 +481,12 @@ sub main {
         next;
       }
 
-      if ($master_logs_fields[1] eq $master_log_pos && $i eq $#master_logs_output) {
+      if ($log_pos eq $master_log_pos && $i eq $#master_logs_output) {
         last EVENT;
       }
 
       my @rest_lines = ();
-      if ($master_logs_fields[1] eq $master_log_pos) {
+      if ($log_pos eq $master_log_pos) {
         @rest_lines = @master_logs_output[ $i+1 .. $#master_logs_output ];
         $master_log_pos = 0;
       } else {
@@ -503,7 +508,7 @@ sub main {
     }
 
     if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
-      STDEBUG && print "exiting because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      warn "exiting because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
       last EVENT;
     }
 
@@ -559,7 +564,7 @@ sub main {
       }
 
       if ($relay_log_space_size gt $relay_log_space_limit) {
-        STDEBUG && print "exiting because it exceeds relay log space limit\n";
+        warn "exiting because it exceeds relay log space limit\n";
         last EVENT;
       }
     }
@@ -611,7 +616,7 @@ sub main {
     }
 
     if ((scalar @fetched_binlog_files) eq 0) {
-      STDEBUG && print "exiting because it will exceeds relay log space limit if continue\n";
+      warn "exiting because it will exceeds relay log space limit if continue\n";
       last EVENT;
     }
 
