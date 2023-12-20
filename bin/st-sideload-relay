@@ -211,6 +211,8 @@ use English qw(-no_match_vars);
 use Data::Dumper;
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
 eval {
    require DBI;
 };
@@ -307,10 +309,22 @@ sub disconnect {
   $self->{dbh}->disconnect();
 }
 
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
 # ############################################################################
 # st_sideload_relay program.
 # ############################################################################
 package st_sideload_relay;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use File::Basename;
+use File::Spec::Functions 'catfile';
+use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 sub main {
   my @ARGV = @_;
@@ -325,6 +339,327 @@ sub main {
     user => $o->get_option('user'),
     password => $o->get_option('password'),
   );
+
+  my $channel_name = $o->get_option('channel-name');
+  my $initial_prefetch = $o->get_option('initial-prefetch');
+  my $io_thread_threshold = $o->get_option('io-thread-threshold');
+  my $tmp_dir = $o->get_option('tmp-dir');
+
+  # get master info from mysql.slave_master_info
+  my $master_info;
+  eval { $master_info = $db->{dbh}->selectrow_hashref('SELECT * FROM mysql.slave_master_info WHERE Channel_name = \'' . $channel_name . '\'') };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Failed to get master info from mysql.slave_master_info for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  if (!$master_info) {
+    $db->disconnect() if $db;
+    die "No master info found for channel '" . $channel_name . "'";
+  }
+
+  STDEBUG && print Dumper($master_info);
+
+  # get initial slave status
+  my $init_slave_status;
+  eval { $init_slave_status = $db->{dbh}->selectrow_hashref('SHOW SLAVE STATUS FOR CHANNEL \'' . $channel_name . '\'') };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  STDEBUG && print Dumper($init_slave_status);
+
+  # stop io_thread
+  eval { $db->{dbh}->do("STOP SLAVE io_thread FOR CHANNEL '${channel_name}'") };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
+  }
+
+  my $initial_run = 1;
+
+  EVENT:
+  while (1) {
+    sleep 1;
+
+    # get slave status
+    my $slave_status;
+    eval { $slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE STATUS FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    # if there is an IO/SQL error, we don't want to continue
+    # in this situation
+    if ($slave_status->{Last_SQL_Error} || $slave_status->{Last_IO_Error}) {
+      warn "Exiting because there is an IO/SQL error, Last_SQL_Error: $slave_status->{Last_SQL_Error}, Last_IO_Error: $slave_status->{Last_IO_Error}";
+      last EVENT;
+    }
+
+    # get master binlog list 
+    open ML, "mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null |";
+    my @master_logs_output = <ML>;
+    close ML;
+
+    # walk through binlog list, get those we need to fetch
+    my $master_log_pos = $slave_status->{Read_Master_Log_Pos};
+    my @master_log_files = ();
+    my $exec_master_log_found = 0;
+    my $exec_read_pos_offset = 0;
+    foreach my $i (0 .. $#master_logs_output) {
+      chomp $master_logs_output[$i];
+      STDEBUG && print $master_logs_output[$i], "\n";
+
+      my @master_logs_fields = split(' ', $master_logs_output[$i]); # in order 'Log_name', 'File_size', 'Encrypted'
+
+      if (!$exec_master_log_found && $slave_status->{Relay_Master_Log_File} eq $master_logs_fields[0]) {
+        $exec_master_log_found = 1;
+      }
+
+      if ($exec_master_log_found) {
+        if ($slave_status->{Relay_Master_Log_File} eq $slave_status->{Master_Log_File}) {
+          $exec_read_pos_offset = $slave_status->{Read_Master_Log_Pos} - $slave_status->{Exec_Master_Log_Pos};
+        } elsif ($master_logs_fields[0] eq $slave_status->{Master_Log_File}) {
+          $exec_read_pos_offset += $slave_status->{Read_Master_Log_Pos};
+        } elsif ($slave_status->{Relay_Master_Log_File} eq $master_logs_fields[0]) {
+          $exec_read_pos_offset += $master_logs_fields[1] - $slave_status->{Exec_Master_Log_Pos};
+        } else {
+          $exec_read_pos_offset += $master_logs_fields[1];
+        }
+      }
+
+      if ($master_logs_fields[0] ne $slave_status->{Master_Log_File}) {
+        next;
+      }
+
+      if ($master_logs_fields[1] eq $master_log_pos && $i eq $#master_logs_output) {
+        last EVENT;
+      }
+
+      my @rest_lines = ();
+      if ($master_logs_fields[1] eq $master_log_pos) {
+        @rest_lines = @master_logs_output[ $i+1 .. $#master_logs_output ];
+        $master_log_pos = 0;
+      } else {
+        @rest_lines = @master_logs_output[ $i .. $#master_logs_output ];
+      }
+
+      @master_log_files = map {
+        my $line = $_;
+        chomp $line;
+        my @fields = split(' ', $line);
+        $fields[0];
+      } @rest_lines;
+
+      last;
+    }
+
+    if ((scalar @master_log_files) eq 0) {
+      last EVENT;
+    }
+
+    if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
+      STDEBUG && print "exiting because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      last EVENT;
+    }
+
+    STDEBUG && print "fetching relay_log_basename for channel '${channel_name}'\n";
+
+    # get relay log basename, so we know where the
+    # relay index file is
+    my $relay_log_basename;
+    eval { $relay_log_basename = $db->{dbh}->selectrow_arrayref('SELECT @@relay_log_basename')->[0] };
+    if ($EVAL_ERROR) {
+      warn "Can't get relay log basename location for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    my $relay_log_index;
+    if ($channel_name eq "") {
+      $relay_log_index = $relay_log_basename . '.index';
+    } else {
+      $relay_log_index = $relay_log_basename . "-${channel_name}" . ".index";
+    }
+
+    STDEBUG && print "parsed relay log index file '$relay_log_index' for channel '${channel_name}'\n";
+
+    my $relay_log_space_limit;
+    eval { $relay_log_space_limit = $db->{dbh}->selectrow_arrayref('SELECT @@relay_log_space_limit')->[0] };
+    if ($EVAL_ERROR) {
+      warn "Can't get relay log space limit for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    my $relay_log_space_size = 0;
+    if ($relay_log_space_limit gt 0) {
+      my $relay_log_fh;
+      eval { open $relay_log_fh, "<", $relay_log_index };
+      if ($EVAL_ERROR) {
+        warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
+        next EVENT;
+      }
+
+      my @relay_log_index_lines = <$relay_log_fh>;
+      close $relay_log_fh;
+
+      foreach my $line (@relay_log_index_lines) {
+        chomp $line;
+        my $relay_log = catfile(dirname($relay_log_basename), basename($line));
+        my $relay_log_size;
+        eval { $relay_log_size = `wc -c < ${relay_log}` };
+        if ($EVAL_ERROR) {
+          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
+        }
+        $relay_log_space_size += $relay_log_size;
+      }
+
+      if ($relay_log_space_size gt $relay_log_space_limit) {
+        STDEBUG && print "exiting because it exceeds relay log space limit\n";
+        last EVENT;
+      }
+    }
+
+    # walk through waiting binlog list,
+    # fetch them with mysqlbinlog
+    my $master_pos_offset = 0;
+    my @fetched_binlog_files = ();
+    my $latest_master_log_file;
+    my $latest_master_log_pos;
+    foreach my $i ( 0 .. $#master_log_files ) {
+      my $master_log_file = $master_log_files[$i];
+      my $pos = $i eq 0 ? $master_log_pos : 0;
+
+      STDEBUG && print "fetching binlog '$master_log_file' at position '$pos' from server -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password}\n";
+
+      my $result_file_prefix = catfile($tmp_dir, "/");
+      my $mysqlbinlog_output;
+      eval { $mysqlbinlog_output = `mysqlbinlog -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file 2>&1` };
+      if ($? ne 0 || $EVAL_ERROR) {
+        warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_output}";
+        next EVENT;
+      }
+
+      my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
+      my $fetched_binlog_size;
+      eval { $fetched_binlog_size = `wc -c < ${fetched_binlog}` };
+      if ($EVAL_ERROR) {
+        warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+        next EVENT;
+      }
+
+      if ($relay_log_space_limit gt 0 && ($relay_log_space_size + $fetched_binlog_size) > $relay_log_space_limit) {
+        # it will exceed relay log space limit if we take this
+        # binlog file, we stop here
+        last;
+      }
+
+      my $trimed_binlog_size = $pos eq 0 ? $fetched_binlog_size : $fetched_binlog_size - 126;
+      $master_pos_offset += $trimed_binlog_size;
+      push(@fetched_binlog_files, $fetched_binlog);
+      $latest_master_log_file = $master_log_file;
+      $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimed_binlog_size : $trimed_binlog_size;
+
+      if ( !$initial_run || $master_pos_offset > $initial_prefetch ) {
+        STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
+        last;
+      }
+    }
+
+    if ((scalar @fetched_binlog_files) eq 0) {
+      STDEBUG && print "exiting because it will exceeds relay log space limit if continue\n";
+      last EVENT;
+    }
+
+    STDEBUG && print "stopping sql_thread for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("STOP SLAVE sql_thread FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Can't stop sql_thread for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    STDEBUG && print "flushing relay logs for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("FLUSH RELAY LOGS FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Can't flush relay logs for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    foreach my $i ( 0 .. $#fetched_binlog_files ) {
+      eval { $db->{dbh}->do("FLUSH RELAY LOGS FOR CHANNEL '${channel_name}'") };
+      if ($EVAL_ERROR) {
+        warn "Can't flush relay logs for channel '$channel_name': ${EVAL_ERROR}";
+        next EVENT;
+      }
+    }
+
+    my $relay_log_fh;
+    eval { open $relay_log_fh, "<", $relay_log_index };
+    if ($EVAL_ERROR) {
+      warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    my @relay_log_index_lines = <$relay_log_fh>;
+    close $relay_log_fh;
+
+    # overwrite those flused relay log files with
+    # fetched binlog files
+    foreach my $i ( 0 .. $#fetched_binlog_files ) {
+      my $fetched_binlog = $fetched_binlog_files[$i];
+      my $relay_log = catfile(dirname($relay_log_basename), basename($relay_log_index_lines[-2-$#fetched_binlog_files+$i]));
+      my $overwrite_relay_output = `cp ${fetched_binlog} ${relay_log}`;
+      if ($? ne 0) {
+        warn "Failed to overwrite latest relay log ${relay_log} with fetched binlog ${fetched_binlog} for channel '${channel_name}': ${overwrite_relay_output}";
+        next EVENT;
+      }
+    }
+
+    eval { $slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE STATUS FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    STDEBUG && print "changing master to RELAY_LOG_FILE='$slave_status->{Relay_Log_File}', RELAY_LOG_POS=$slave_status->{Relay_Log_Pos}, MASTER_LOG_FILE='${latest_master_log_file}', MASTER_LOG_POS=${latest_master_log_pos} for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("CHANGE MASTER TO RELAY_LOG_FILE='$slave_status->{Relay_Log_File}', RELAY_LOG_POS=$slave_status->{Relay_Log_Pos}, MASTER_LOG_FILE='${latest_master_log_file}', MASTER_LOG_POS=${latest_master_log_pos} FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Can't update relay logs and master logs pos for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    $initial_run = 0;
+
+    # remove those fetched temporary binlog files
+    foreach my $fetched_binlog ( @fetched_binlog_files ) {
+      my $remove_fetched_binlog_output;
+      eval { $remove_fetched_binlog_output = `rm -f ${fetched_binlog} 2>&1` };
+      if ($EVAL_ERROR) {
+        warn "Failed to delete fetched binlog file '${fetched_binlog}' for channel '$channel_name': ${EVAL_ERROR}";
+      }
+    }
+
+    STDEBUG && print "starting sql_thread for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("START SLAVE sql_thread FOR CHANNEL '${channel_name}'") };
+    if ($EVAL_ERROR) {
+      warn "Can't start sql_thread for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+  }
+
+  # start io_thread if it was running
+  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
+    eval { $db->{dbh}->do("START SLAVE io_thread FOR CHANNEL '$channel_name'") };
+    if ($EVAL_ERROR) {
+      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
+    }
+  }
 
   $db->disconnect() if $db;
   return 0;
