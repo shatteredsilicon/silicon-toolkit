@@ -485,26 +485,10 @@ sub main {
     }
   }
 
-  my $binlog_header_size = 126;
   my $mariadb_channel_arg = '';
   my $mysql_channel_arg = '';
   if (lc($mysql_version) =~ m/mariadb/) {
     $mariadb_channel_arg = "'$channel_name'";
-
-    my $encrypt_binlog_output;
-    eval { $encrypt_binlog_output = `mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW VARIABLE LIKE 'encrypt_binlog'\" 2>/dev/null` };
-    if ($EVAL_ERROR) {
-      $db->disconnect() if $db;
-      die "Can't get encrypt_binlog for channel '${channel_name}': ${EVAL_ERROR}";
-    }
-
-    chomp $encrypt_binlog_output;
-    my $encrypt_binlog = (split(' ', $encrypt_binlog_output))[1];
-    if (defined $encrypt_binlog && $db->is_true()) {
-      $binlog_header_size = 296;
-    } else {
-      $binlog_header_size = 256;
-    }
   } else {
     $mysql_channel_arg = "FOR CHANNEL '$channel_name'"
   }
@@ -719,7 +703,7 @@ sub main {
 
       my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
       my $fetched_binlog_size;
-      eval { $fetched_binlog_size = `wc -c < ${fetched_binlog}` };
+      eval { $fetched_binlog_size = -s "${fetched_binlog}" };
       if ($EVAL_ERROR) {
         warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
         next EVENT;
@@ -731,7 +715,40 @@ sub main {
         last;
       }
 
-      my $trimed_binlog_size = $pos eq 0 ? $fetched_binlog_size : $fetched_binlog_size - $binlog_header_size;
+      my $trimed_binlog_size;
+      if ($pos eq 0) {
+        $trimed_binlog_size = $fetched_binlog_size;
+      } else {
+        my $fetched_binlog_fh;
+        eval { open $fetched_binlog_fh, '<:raw', "${fetched_binlog}" };
+        if ($EVAL_ERROR) {
+          warn "Failed to open fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
+        }
+
+        my $info_event_bytes = '';
+        my $ok = read $fetched_binlog_fh, $info_event_bytes, 17; # lenght is 4 bytes, offset 4 magic bytes and another 9 bytes as part of the first info event header
+        close $fetched_binlog_fh;
+
+        if (!defined $ok || !$ok || length($info_event_bytes) ne 17 ) {
+          warn "Failed to read fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
+        }
+
+        STDEBUG && print "parsed lenght bytes of first info log event: ${info_event_bytes}\n";
+
+        my $info_event_len = 0;
+        my $bit_offset = 0;
+        foreach my $c ((split('', $info_event_bytes))[-4..-1]) {
+          STDEBUG && print "parsed character byte of first info log event: ${c}\n";
+          $info_event_len += ord($c) << $bit_offset;
+          $bit_offset += 8;
+        }
+
+        STDEBUG && print "parsed lenght of first info log event: ${info_event_len}\n";
+
+        $trimed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and lenght of first info event 
+      }
       $master_pos_offset += $trimed_binlog_size;
       push(@fetched_binlog_files, $fetched_binlog);
       $latest_master_log_file = $master_log_file;
