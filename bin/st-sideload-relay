@@ -613,8 +613,9 @@ sub main {
     }
 
     if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
-      warn "exiting because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
-      last EVENT;
+      warn "sleeping 10s because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      sleep 9;
+      next EVENT;
     }
 
     STDEBUG && print "fetching relay_log_basename for channel '${channel_name}'\n";
