@@ -342,6 +342,7 @@ use English qw(-no_match_vars);
 use Data::Dumper;
 use File::Basename;
 use File::Spec::Functions 'catfile', 'file_name_is_absolute';
+use Capture::Tiny ':all';
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 my @CLI_SSL_TLS_ARGS = ('ssl-ca', 'ssl-capath', 'ssl-cert', 'ssl-cipher', 'ssl-key', 'ssl-crl', 'ssl-crlpath', 'tls-version', 'tls-ciphersuites');
@@ -548,12 +549,19 @@ sub main {
     STDEBUG && print "fetching master log list with mysql cli args: -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B\n";
 
     # get master binlog list
-    my @master_logs_output;
-    eval { @master_logs_output = `${mysql_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null` };
-    if ($? ne 0) {
-      warn "Failed to fetch master log list with mysql cli, exit code: $?";
+    my ($master_logs_output, $master_logs_stderr, $master_logs_exit) = capture {
+      system("${mysql_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\"");
+    };
+    if ($master_logs_exit ne 0) {
+      if ($master_logs_stderr =~ m/ERROR 1227 \(42000\)/) {
+        warn "Failed to fetch master log list with mysql cli, check that the '$master_info->{User_name}' has 'REPLICATION CLIENT' privileges";
+      } else {
+        warn "Failed to fetch master log list with mysql cli:\n${master_logs_stderr}";
+      }
       last EVENT;
     }
+
+    my @master_logs_output = split /^/, $master_logs_output;
 
     STDEBUG && print "@master_logs_output" . "\n";
 
@@ -674,10 +682,11 @@ sub main {
       foreach my $line (@relay_log_index_lines) {
         chomp $line;
         my $relay_log = catfile(dirname($relay_log_basename), basename($line));
-        my $relay_log_size;
-        eval { $relay_log_size = `wc -c < ${relay_log}` };
-        if ($EVAL_ERROR) {
-          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${EVAL_ERROR}";
+        my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
+          system("wc -c < ${relay_log}");
+        };
+        if ($relay_log_size_stderr ne 0) {
+          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
           next EVENT;
         }
         $relay_log_space_size += $relay_log_size;
@@ -702,10 +711,11 @@ sub main {
       STDEBUG && print "fetching binlog '$master_log_file' at position '$pos' from server -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password}\n";
 
       my $result_file_prefix = catfile($tmp_dir, "/");
-      my $mysqlbinlog_output;
-      eval { $mysqlbinlog_output = `${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file 2>&1` };
-      if ($? ne 0 || $EVAL_ERROR) {
-        warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_output}";
+      my ($mysqlbinlog_output, $mysqlbinlog_stderr, $mysqlbinlog_exit) = capture {
+        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file");
+      };
+      if ($mysqlbinlog_exit ne 0) {
+        warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_stderr}";
         next EVENT;
       }
 
@@ -813,9 +823,11 @@ sub main {
       my $fetched_binlog = $fetched_binlog_files[$i];
       my $relay_log = catfile(dirname($relay_log_basename), basename($relay_log_index_lines[-2-$#fetched_binlog_files+$i]));
       STDEBUG && print "overwriting ${relay_log} with ${fetched_binlog}\n";
-      my $overwrite_relay_output = `cp ${fetched_binlog} ${relay_log}`;
-      if ($? ne 0) {
-        warn "Failed to overwrite latest relay log ${relay_log} with fetched binlog ${fetched_binlog} for channel '${channel_name}': ${overwrite_relay_output}";
+      my ($overwrite_relay_output, $overwrite_relay_stderr, $overwrite_relay_exit) = capture {
+        system("cp ${fetched_binlog} ${relay_log}");
+      };
+      if ($overwrite_relay_exit ne 0) {
+        warn "Failed to overwrite latest relay log ${relay_log} with fetched binlog ${fetched_binlog} for channel '${channel_name}': ${overwrite_relay_stderr}";
         next EVENT;
       }
     }
@@ -838,10 +850,11 @@ sub main {
 
     # remove those fetched temporary binlog files
     foreach my $fetched_binlog ( @fetched_binlog_files ) {
-      my $remove_fetched_binlog_output;
-      eval { $remove_fetched_binlog_output = `rm -f ${fetched_binlog} 2>&1` };
-      if ($EVAL_ERROR) {
-        warn "Failed to delete fetched binlog file '${fetched_binlog}' for channel '$channel_name': ${EVAL_ERROR}";
+      my ($remove_fetched_binlog_output, $remove_fetched_binlog_stderr, $remove_fetched_binlog_exit) = capture {
+        system("rm -f ${fetched_binlog}");
+      };
+      if ($remove_fetched_binlog_exit ne 0) {
+        warn "Failed to delete fetched binlog file '${fetched_binlog}' for channel '$channel_name': ${remove_fetched_binlog_stderr}";
       }
     }
 
