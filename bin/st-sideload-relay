@@ -52,7 +52,9 @@ sub new {
     "socket|S=s" => \my $socket,
     "port|P=i" => \(my $port = 3306),
     "tmp-dir=s" => \(my $tmp_dir = '/tmp'),
-    "master-info-file" => \(my $mariadb_master_info_file = 'master.info')
+    "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
+    "mysql-cli" => \(my $mysql_cli = 'mysql'),
+    "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog')
   );
   GetOptions(
     %options
@@ -69,7 +71,9 @@ sub new {
       'socket' => $socket,
       'port' => $port,
       'tmp-dir' => $tmp_dir,
-      'master-info-file' => $mariadb_master_info_file
+      'master-info-file' => $mariadb_master_info_file,
+      'mysql-cli' => $mysql_cli,
+      'mysqlbinlog-cli' => $mysqlbinlog_cli
     },
   };
 
@@ -160,7 +164,8 @@ sub parse_dsn {
 
   # read default socket path from output of
   # 'mysqlbinlog --print-defaults'
-  open FH, "mysqlbinlog --print-defaults |";
+  my $mysqlbinlog_cli = $self->get_option('mysqlbinlog-cli');
+  open FH, "${mysqlbinlog_cli} --print-defaults |";
 	my @lines = <FH>;
 	close FH;
 
@@ -377,6 +382,8 @@ sub main {
   my $io_thread_threshold = $o->get_option('io-thread-threshold');
   my $tmp_dir = $o->get_option('tmp-dir');
   my $master_info_file = $o->get_option('master-info-file');
+  my $mysql_cli = $o->get_option('mysql-cli');
+  my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
 
   my $mysql_version;
   eval { $mysql_version = $db->{dbh}->selectrow_arrayref('SELECT @@version')->[0] };
@@ -542,7 +549,7 @@ sub main {
 
     # get master binlog list
     my @master_logs_output;
-    eval { @master_logs_output = `mysql -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null` };
+    eval { @master_logs_output = `${mysql_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\" 2>/dev/null` };
     if ($? ne 0) {
       warn "Failed to fetch master log list with mysql cli, exit code: $?";
       last EVENT;
@@ -696,7 +703,7 @@ sub main {
 
       my $result_file_prefix = catfile($tmp_dir, "/");
       my $mysqlbinlog_output;
-      eval { $mysqlbinlog_output = `mysqlbinlog -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file 2>&1` };
+      eval { $mysqlbinlog_output = `${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file 2>&1` };
       if ($? ne 0 || $EVAL_ERROR) {
         warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_output}";
         next EVENT;
@@ -970,6 +977,18 @@ Directory for storing temporary files.
 default: master.info
 
 Location of master info file.
+
+=item B<--mysql-cli>
+
+default: mysql
+
+Name/Path of mysql cli.
+
+=item B<--mysqlbinlog-cli>
+
+default: mysqlbinlog
+
+Name/Path of mysqlbinlog cli.
 
 =item B<--help>
 
