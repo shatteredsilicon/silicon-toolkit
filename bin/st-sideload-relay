@@ -717,7 +717,7 @@ sub main {
 
       my $result_file_prefix = catfile($tmp_dir, "/");
       my ($mysqlbinlog_output, $mysqlbinlog_stderr, $mysqlbinlog_exit) = capture {
-        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=/tmp/ --start-position=$pos $master_log_file");
+        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=${result_file_prefix} --start-position=$pos $master_log_file");
       };
       if ($mysqlbinlog_exit ne 0) {
         warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_stderr}";
@@ -731,6 +731,8 @@ sub main {
         warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
         next EVENT;
       }
+
+      STDEBUG && print "fetched binlog: ${fetched_binlog}, size: ${fetched_binlog_size}\n";
 
       if ($relay_log_space_limit gt 0 && ($relay_log_space_size + $fetched_binlog_size) > $relay_log_space_limit) {
         # it will exceed relay log space limit if we take this
