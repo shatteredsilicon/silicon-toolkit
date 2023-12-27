@@ -671,7 +671,7 @@ sub main {
     }
 
     my $relay_log_space_size = 0;
-    if ($relay_log_space_limit gt 0) {
+    if ($relay_log_space_limit > 0) {
       my $relay_log_fh;
       eval { open $relay_log_fh, "<", $relay_log_index };
       if ($EVAL_ERROR) {
@@ -688,14 +688,16 @@ sub main {
         my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
           system("wc -c < ${relay_log}");
         };
-        if ($relay_log_size_stderr ne 0) {
+        if ($relay_log_size_exit ne 0) {
           warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
           next EVENT;
         }
         $relay_log_space_size += $relay_log_size;
       }
 
-      if ($relay_log_space_size gt $relay_log_space_limit) {
+      STDEBUG && print "parsed relay log space size: ${relay_log_space_size}, limit: ${relay_log_space_limit}\n";
+
+      if ($relay_log_space_size >= $relay_log_space_limit) {
         warn "exiting because it exceeds relay log space limit\n";
         last EVENT;
       }
