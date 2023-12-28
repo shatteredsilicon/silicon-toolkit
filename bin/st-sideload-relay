@@ -1,0 +1,1045 @@
+#!/usr/bin/env perl
+
+# This is st-sideload-relay, a program to sideload relay logs on a MySQL slave.
+#
+# Copyright (C) 2023  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class, $opt_str ) = @_;
+
+  my $initial_prefetch = 2 * 1024 * 1024 * 1024; # default 2G
+  my $io_thread_threshold = 1024 * 1024 * 1024; # default 1G
+
+  my %options = (
+    "initial-prefetch=s" => sub { my ($name, $value) = @_; my $val = parse_size_arg($name, $value); if (defined $val) { $initial_prefetch = $val; } else { pod2usage; } },
+    "io-thread-threshold=s" => sub { my ($name, $value) = @_; my $val = parse_size_arg($name, $value); if (defined $val) { $io_thread_threshold = $val; } else { pod2usage; } },
+    "channel-name|C=s" => \(my $channel_name = ''),
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "tmp-dir=s" => \(my $tmp_dir = '/tmp'),
+    "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
+    "mysql-cli" => \(my $mysql_cli = 'mysql'),
+    "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog')
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+
+  my $self = {
+    args => {
+      'initial-prefetch' => $initial_prefetch,
+      'io-thread-threshold' => $io_thread_threshold,
+      'channel-name' => $channel_name,
+      'user' => $user,
+      'password' => $password,
+      'host' => $host,
+      'socket' => $socket,
+      'port' => $port,
+      'tmp-dir' => $tmp_dir,
+      'master-info-file' => $mariadb_master_info_file,
+      'mysql-cli' => $mysql_cli,
+      'mysqlbinlog-cli' => $mysqlbinlog_cli
+    },
+  };
+
+  if (defined $opt_str) {
+    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              $self->{args}->{$primary_name} = $opt_val;
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    STDEBUG && print $conf_file . "\n";
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file" )) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # read default socket path from output of
+  # 'mysqlbinlog --print-defaults'
+  my $mysqlbinlog_cli = $self->get_option('mysqlbinlog-cli');
+  open FH, "${mysqlbinlog_cli} --print-defaults |";
+	my @lines = <FH>;
+	close FH;
+
+  foreach my $line (@lines) {
+    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
+      $self->{args}->{socket} = "$path";
+      last;
+    }
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+sub parse_size_arg {
+  my ($name, $value) = @_;
+
+  my %factor_for = (
+    K => 1_024,
+    M => 1_048_576,
+    G => 1_073_741_824,
+    T => 1_099_511_627_776,
+  );
+
+  my ($pre, $num, $factor) = $value =~ m/^([+-])?(\d+)([KMGT])?B?$/;
+  if ( defined $num ) {
+    if ( $factor ) {
+        $num *= $factor_for{$factor};
+    }
+    STDEBUG && print $name . ": " . $num . "\n";
+    return $num * 1;
+  }
+
+  return undef;
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 0,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if ($socket) {
+    $dsn = "${dsn};${socket_opt}=${socket};";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host};";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_sideload_relay program.
+# ############################################################################
+package st_sideload_relay;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use File::Basename;
+use File::Spec::Functions 'catfile', 'file_name_is_absolute';
+use Capture::Tiny ':all';
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @CLI_SSL_TLS_ARGS = ('ssl-ca', 'ssl-capath', 'ssl-cert', 'ssl-cipher', 'ssl-key', 'ssl-crl', 'ssl-crlpath', 'tls-version', 'tls-ciphersuites');
+my $LINES_IN_MASTER_INFO_WITH_SSL = 14;
+my %MASTER_INFO_FIELD_LINES = (
+  'Host' => 2,
+  'User_name' => 3,
+  'User_password' => 4,
+  'Port' => 5,
+  'Enabled_ssl' => 7,
+  'Ssl_ca' => 8,
+  'Ssl_capath' => 9,
+  'Ssl_cert' => 10,
+  'Ssl_cipher' => 11,
+  'Ssl_key' => 12,
+  'Ssl_crl' => 19,
+  'Ssl_crlpath' => 20,
+  'Tls_version' => 23,
+  'Tls_ciphersuites' => 29
+);
+
+sub main {
+  my @ARGV = @_;
+
+  my $o = new Option(shift @ARGV);
+  $o->parse_dsn();
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $o->get_option('password'),
+  );
+
+  my $channel_name = $o->get_option('channel-name');
+  my $initial_prefetch = $o->get_option('initial-prefetch');
+  my $io_thread_threshold = $o->get_option('io-thread-threshold');
+  my $tmp_dir = $o->get_option('tmp-dir');
+  my $master_info_file = $o->get_option('master-info-file');
+  my $mysql_cli = $o->get_option('mysql-cli');
+  my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
+
+  my $mysql_version;
+  eval { $mysql_version = $db->{dbh}->selectrow_arrayref('SELECT @@version')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get version for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  my $hostname;
+  eval { $hostname = $db->{dbh}->selectall_arrayref('SELECT @@hostname')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get hostname for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  my $datadir;
+  eval { $datadir = $db->{dbh}->selectrow_arrayref('SELECT @@datadir')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get datadir for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  my $master_info_repository;
+  eval { $master_info_repository = $db->{dbh}->selectrow_hashref('SHOW VARIABLES LIKE \'master_info_repository\'') };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get master info repository for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  # get master info from mysql.slave_master_info or master.info
+  my $master_info = {};
+  if ($master_info_repository && lc(($master_info_repository->{Value} || $master_info_repository->{value})) eq 'table') {
+    eval { $master_info = $db->{dbh}->selectrow_hashref('SELECT * FROM mysql.slave_master_info WHERE Channel_name = \'' . $channel_name . '\'') };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Failed to get master info from mysql.slave_master_info for channel '${channel_name}': ${EVAL_ERROR}";
+    }
+  } else {
+    if (!file_name_is_absolute($master_info_file)) {
+      $master_info_file = catfile($datadir, $master_info_file);
+    }
+    if ($channel_name ne '') {
+      my ($base, $dir, $ext) = fileparse($master_info_file, qr{\..*});
+      $master_info_file = $dir . "${base}-${channel_name}" . $ext;
+    }
+
+    STDEBUG && print "parsed master.info ${master_info_file}\n";
+
+    if (! -e "${master_info_file}") {
+      $db->disconnect() if $db;
+      die "master.info file '${master_info_file}' for channel '${channel_name}' doesn't exist";
+    }
+
+    my $master_info_file_fh;
+    eval { open $master_info_file_fh, "<", $master_info_file };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't open master.info file '${master_info_file}': ${EVAL_ERROR}";
+    }
+
+    my @master_info_file_lines = <$master_info_file_fh>;
+    close $master_info_file_fh;
+
+    my $lines = 7;
+    if ((scalar @master_info_file_lines) gt 0) {
+      my $first_line = $master_info_file_lines[0];
+      chomp $first_line;
+      if ($first_line =~ m/^\d+$/ && $first_line ge $LINES_IN_MASTER_INFO_WITH_SSL) {
+        $lines = $first_line + 0;
+        shift @master_info_file_lines;
+      }
+    }
+
+    foreach my $key (keys %MASTER_INFO_FIELD_LINES) {
+      # STDEBUG && print "master.info key: $key, lines: $lines, line: $MASTER_INFO_FIELD_LINES{\"$key\"}\n";
+      STDEBUG && print "$key $lines $MASTER_INFO_FIELD_LINES{\"$key\"} " . (scalar @master_info_file_lines) . " $MASTER_INFO_FIELD_LINES{\"$key\"}" . "\n";
+      if ($lines > $MASTER_INFO_FIELD_LINES{"$key"} && (scalar @master_info_file_lines) >= $MASTER_INFO_FIELD_LINES{"$key"}) {
+        chomp $master_info_file_lines[$MASTER_INFO_FIELD_LINES{"$key"}];
+        $master_info->{"$key"} = $master_info_file_lines[$MASTER_INFO_FIELD_LINES{"$key"}];
+      }
+    }
+  }
+
+  STDEBUG && print Dumper($master_info);
+
+  my $mysql_extra_args = '';
+  if ($db->is_true($master_info->{Enabled_ssl})) {
+    foreach my $key (keys %{$master_info}) {
+      my $lc_key = lc($key);
+      $lc_key =~ s/_/-/g;
+      if (!(grep $_ eq $lc_key, @CLI_SSL_TLS_ARGS)) {
+        next;
+      }
+
+      my $value = defined $master_info->{$key} ? $master_info->{$key} : '';
+      my $lc_value = lc($value);
+      if ($lc_key eq 'ssl-cert' || $lc_key eq 'ssl-key') {
+        if (!file_name_is_absolute($value)) {
+          $value = catfile($datadir, $value);
+        }
+      }
+
+      if (($lc_key =~ m/^ssl-/ || $lc_key =~ m/^tls-/ ) && ($lc_value ne '' && $lc_value ne 'null')) {
+        $mysql_extra_args = "$mysql_extra_args --$lc_key $value";
+      }
+    }
+  }
+
+  my $mariadb_channel_arg = '';
+  my $mysql_channel_arg = '';
+  if (lc($mysql_version) =~ m/mariadb/) {
+    $mariadb_channel_arg = "'$channel_name'";
+  } else {
+    $mysql_channel_arg = "FOR CHANNEL '$channel_name'"
+  }
+
+  if (!$master_info) {
+    $db->disconnect() if $db;
+    die "No master info found for channel '" . $channel_name . "'";
+  }
+
+  STDEBUG && print Dumper($master_info);
+
+  # get initial slave status
+  my $init_slave_status;
+  eval { $init_slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+  }
+
+  $SIG{INT} = sub { my ($signal) = @_; terminate_handler($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg); };
+  $SIG{TERM} = sub { my ($signal) = @_; terminate_handler($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg); };
+
+  STDEBUG && print Dumper($init_slave_status);
+
+  # stop io_thread
+  eval { $db->{dbh}->do("STOP SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
+  }
+
+  my $initial_run = 1;
+
+  EVENT:
+  while (1) {
+    sleep 1;
+
+    # get slave status
+    my $slave_status;
+    eval { $slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    # if there is an IO/SQL error, we don't want to continue
+    # in this situation
+    if ($slave_status->{Last_SQL_Error} || $slave_status->{Last_IO_Error}) {
+      warn "Exiting because there is an IO/SQL error, Last_SQL_Error: $slave_status->{Last_SQL_Error}, Last_IO_Error: $slave_status->{Last_IO_Error}";
+      last EVENT;
+    }
+
+    STDEBUG && print "fetching master log list with mysql cli args: -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B\n";
+
+    # get master binlog list
+    my ($master_logs_output, $master_logs_stderr, $master_logs_exit) = capture {
+      system("${mysql_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B -e \"SHOW MASTER LOGS\"");
+    };
+    if ($master_logs_exit ne 0) {
+      if ($master_logs_stderr =~ m/ERROR 1227 \(42000\)/) {
+        warn "Failed to fetch master log list with mysql cli, check that the '$master_info->{User_name}' has 'REPLICATION CLIENT' privileges";
+      } else {
+        warn "Failed to fetch master log list with mysql cli:\n${master_logs_stderr}";
+      }
+      last EVENT;
+    }
+
+    my @master_logs_output = split /^/, $master_logs_output;
+
+    STDEBUG && print "@master_logs_output" . "\n";
+
+    # walk through binlog list, get those we need to fetch
+    my $master_log_pos = $slave_status->{Read_Master_Log_Pos};
+    my @master_log_files = ();
+    my $exec_master_log_found = 0;
+    my $exec_read_pos_offset = 0;
+    foreach my $i (0 .. $#master_logs_output) {
+      chomp $master_logs_output[$i];
+      STDEBUG && print $master_logs_output[$i], "\n";
+
+      my @master_logs_fields = split(' ', $master_logs_output[$i]); # in order 'Log_name', 'File_size', 'Encrypted'
+
+      if (!$exec_master_log_found && $slave_status->{Relay_Master_Log_File} eq $master_logs_fields[0]) {
+        $exec_master_log_found = 1;
+      }
+
+      my $log_pos = $master_logs_fields[1];
+      if (defined $master_logs_fields[2] && $db->is_true($master_logs_fields[2])) {
+        $log_pos -= 512;
+      }
+
+      if ($exec_master_log_found) {
+        if ($slave_status->{Relay_Master_Log_File} eq $slave_status->{Master_Log_File}) {
+          $exec_read_pos_offset = $slave_status->{Read_Master_Log_Pos} - $slave_status->{Exec_Master_Log_Pos};
+        } elsif ($master_logs_fields[0] eq $slave_status->{Master_Log_File}) {
+          $exec_read_pos_offset += $slave_status->{Read_Master_Log_Pos};
+        } elsif ($slave_status->{Relay_Master_Log_File} eq $master_logs_fields[0]) {
+          $exec_read_pos_offset += $log_pos - $slave_status->{Exec_Master_Log_Pos};
+        } else {
+          $exec_read_pos_offset += $log_pos;
+        }
+      }
+
+      if ($master_logs_fields[0] ne $slave_status->{Master_Log_File}) {
+        next;
+      }
+
+      if ($log_pos eq $master_log_pos && $i eq $#master_logs_output) {
+        last EVENT;
+      }
+
+      my @rest_lines = ();
+      if ($log_pos eq $master_log_pos) {
+        @rest_lines = @master_logs_output[ $i+1 .. $#master_logs_output ];
+        $master_log_pos = 0;
+      } else {
+        @rest_lines = @master_logs_output[ $i .. $#master_logs_output ];
+      }
+
+      @master_log_files = map {
+        my $line = $_;
+        chomp $line;
+        my @fields = split(' ', $line);
+        $fields[0];
+      } @rest_lines;
+
+      last;
+    }
+
+    if ((scalar @master_log_files) eq 0) {
+      last EVENT;
+    }
+
+    if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
+      warn "sleeping 10s because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      sleep 9;
+      next EVENT;
+    }
+
+    STDEBUG && print "fetching relay_log_basename for channel '${channel_name}'\n";
+
+    # get relay log basename, so we know where the
+    # relay index file is
+    my $relay_log_basename;
+    eval { $relay_log_basename = $db->{dbh}->selectrow_arrayref('SELECT @@relay_log_basename')->[0] };
+    if ($EVAL_ERROR) {
+      warn "Can't get relay log basename location for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    # @@relay_log_basename is empty, we have to
+    # parse it manually with default values
+    if (!defined $relay_log_basename || !$relay_log_basename) {
+      my $index_suffix = $channel_name eq '' ? '.index' : "-${channel_name}.index";
+      my @possible_prefix = (${hostname}, 'mysqld', 'mariadb');
+      foreach my $prefix (@possible_prefix) {
+        if (-e catfile($datadir, "${prefix}-relay-bin${index_suffix}")) {
+          $relay_log_basename = catfile($datadir, "${prefix}-relay-bin");
+        }
+      }
+    }
+
+    my $relay_log_index = $channel_name eq '' ? "${relay_log_basename}.index" : "${relay_log_basename}-${channel_name}.index";
+
+    STDEBUG && print "parsed relay log index file '$relay_log_index' for channel '${channel_name}'\n";
+
+    my $relay_log_space_limit;
+    eval { $relay_log_space_limit = $db->{dbh}->selectrow_arrayref('SELECT @@relay_log_space_limit')->[0] };
+    if ($EVAL_ERROR) {
+      warn "Can't get relay log space limit for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    my $relay_log_space_size = 0;
+    if ($relay_log_space_limit > 0) {
+      my $relay_log_fh;
+      eval { open $relay_log_fh, "<", $relay_log_index };
+      if ($EVAL_ERROR) {
+        warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
+        next EVENT;
+      }
+
+      my @relay_log_index_lines = <$relay_log_fh>;
+      close $relay_log_fh;
+
+      foreach my $line (@relay_log_index_lines) {
+        chomp $line;
+        my $relay_log = catfile(dirname($relay_log_basename), basename($line));
+        my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
+          system("wc -c < ${relay_log}");
+        };
+        if ($relay_log_size_exit ne 0) {
+          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
+          next EVENT;
+        }
+        $relay_log_space_size += $relay_log_size;
+      }
+
+      STDEBUG && print "parsed relay log space size: ${relay_log_space_size}, limit: ${relay_log_space_limit}\n";
+
+      if ($relay_log_space_size >= $relay_log_space_limit) {
+        warn "exiting because it exceeds relay log space limit\n";
+        last EVENT;
+      }
+    }
+
+    # walk through waiting binlog list,
+    # fetch them with mysqlbinlog
+    my $master_pos_offset = 0;
+    my @fetched_binlog_files = ();
+    my $latest_master_log_file;
+    my $latest_master_log_pos;
+    foreach my $i ( 0 .. $#master_log_files ) {
+      my $master_log_file = $master_log_files[$i];
+      my $pos = $i eq 0 ? $master_log_pos : 0;
+
+      STDEBUG && print "fetching binlog '$master_log_file' at position '$pos' from server -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password}\n";
+
+      my $result_file_prefix = catfile($tmp_dir, "/");
+      my ($mysqlbinlog_output, $mysqlbinlog_stderr, $mysqlbinlog_exit) = capture {
+        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=${result_file_prefix} --start-position=$pos $master_log_file");
+      };
+      if ($mysqlbinlog_exit ne 0) {
+        warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_stderr}";
+        next EVENT;
+      }
+
+      my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
+      my $fetched_binlog_size;
+      eval { $fetched_binlog_size = -s "${fetched_binlog}" };
+      if ($EVAL_ERROR) {
+        warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+        next EVENT;
+      }
+
+      STDEBUG && print "fetched binlog: ${fetched_binlog}, size: ${fetched_binlog_size}\n";
+
+      if ($relay_log_space_limit gt 0 && ($relay_log_space_size + $fetched_binlog_size) > $relay_log_space_limit) {
+        # it will exceed relay log space limit if we take this
+        # binlog file, we stop here
+        last;
+      }
+
+      my $trimed_binlog_size;
+      if ($pos eq 0) {
+        $trimed_binlog_size = $fetched_binlog_size;
+      } else {
+        my $fetched_binlog_fh;
+        eval { open $fetched_binlog_fh, '<:raw', "${fetched_binlog}" };
+        if ($EVAL_ERROR) {
+          warn "Failed to open fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
+        }
+
+        my $info_event_bytes = '';
+        my $ok = read $fetched_binlog_fh, $info_event_bytes, 17; # lenght is 4 bytes, offset 4 magic bytes and another 9 bytes as part of the first info event header
+        close $fetched_binlog_fh;
+
+        if (!defined $ok || !$ok || length($info_event_bytes) ne 17 ) {
+          warn "Failed to read fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
+        }
+
+        STDEBUG && print "parsed lenght bytes of first info log event: ${info_event_bytes}\n";
+
+        my $info_event_len = 0;
+        my $bit_offset = 0;
+        foreach my $c ((split('', $info_event_bytes))[-4..-1]) {
+          STDEBUG && print "parsed character byte of first info log event: ${c}\n";
+          $info_event_len += ord($c) << $bit_offset;
+          $bit_offset += 8;
+        }
+
+        STDEBUG && print "parsed lenght of first info log event: ${info_event_len}\n";
+
+        $trimed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and lenght of first info event 
+      }
+      $master_pos_offset += $trimed_binlog_size;
+      push(@fetched_binlog_files, $fetched_binlog);
+      $latest_master_log_file = $master_log_file;
+      $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimed_binlog_size : $trimed_binlog_size;
+
+      if ( !$initial_run || $master_pos_offset > $initial_prefetch ) {
+        STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
+        last;
+      }
+    }
+
+    if ((scalar @fetched_binlog_files) eq 0) {
+      warn "exiting because it will exceeds relay log space limit if continue\n";
+      last EVENT;
+    }
+
+    STDEBUG && print "stopping sql_thread for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("STOP SLAVE ${mariadb_channel_arg} sql_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't stop sql_thread for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    STDEBUG && print "flushing relay logs for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("FLUSH RELAY LOGS ${mariadb_channel_arg} ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't flush relay logs for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    foreach my $i ( 0 .. $#fetched_binlog_files ) {
+      eval { $db->{dbh}->do("FLUSH RELAY LOGS ${mariadb_channel_arg} ${mysql_channel_arg}") };
+      if ($EVAL_ERROR) {
+        warn "Can't flush relay logs for channel '$channel_name': ${EVAL_ERROR}";
+        next EVENT;
+      }
+    }
+
+    my $relay_log_fh;
+    eval { open $relay_log_fh, "<", $relay_log_index };
+    if ($EVAL_ERROR) {
+      warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    my @relay_log_index_lines = <$relay_log_fh>;
+    close $relay_log_fh;
+
+    # overwrite those flused relay log files with
+    # fetched binlog files
+    foreach my $i ( 0 .. $#fetched_binlog_files ) {
+      my $fetched_binlog = $fetched_binlog_files[$i];
+      my $relay_log = catfile(dirname($relay_log_basename), basename($relay_log_index_lines[-2-$#fetched_binlog_files+$i]));
+      STDEBUG && print "overwriting ${relay_log} with ${fetched_binlog}\n";
+      my ($overwrite_relay_output, $overwrite_relay_stderr, $overwrite_relay_exit) = capture {
+        system("cp ${fetched_binlog} ${relay_log}");
+      };
+      if ($overwrite_relay_exit ne 0) {
+        warn "Failed to overwrite latest relay log ${relay_log} with fetched binlog ${fetched_binlog} for channel '${channel_name}': ${overwrite_relay_stderr}";
+        next EVENT;
+      }
+    }
+
+    eval { $slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    STDEBUG && print "changing master to RELAY_LOG_FILE='$slave_status->{Relay_Log_File}', RELAY_LOG_POS=$slave_status->{Relay_Log_Pos}, MASTER_LOG_FILE='${latest_master_log_file}', MASTER_LOG_POS=${latest_master_log_pos} for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("CHANGE MASTER ${mariadb_channel_arg} TO RELAY_LOG_FILE='$slave_status->{Relay_Log_File}', RELAY_LOG_POS=$slave_status->{Relay_Log_Pos}, MASTER_LOG_FILE='${latest_master_log_file}', MASTER_LOG_POS=${latest_master_log_pos} ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't update relay logs and master logs pos for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
+    $initial_run = 0;
+
+    # remove those fetched temporary binlog files
+    foreach my $fetched_binlog ( @fetched_binlog_files ) {
+      my ($remove_fetched_binlog_output, $remove_fetched_binlog_stderr, $remove_fetched_binlog_exit) = capture {
+        system("rm -f ${fetched_binlog}");
+      };
+      if ($remove_fetched_binlog_exit ne 0) {
+        warn "Failed to delete fetched binlog file '${fetched_binlog}' for channel '$channel_name': ${remove_fetched_binlog_stderr}";
+      }
+    }
+
+    STDEBUG && print "starting sql_thread for channel '${channel_name}'\n";
+
+    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} sql_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't start sql_thread for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
+    }
+  }
+
+  # start io_thread if it was running
+  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
+    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
+    }
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+sub terminate_handler {
+  my ($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg) = @_;
+
+  STDEBUG && print "got a signal '$signal' that's handled by terminate_handler\n";
+
+  # start io_thread if it was running
+  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
+    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
+    }
+  }
+
+  # start sql_thread if it was running
+  if ($db->is_true($init_slave_status->{Slave_SQL_Running})) {
+    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} sql_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't start sql_thread for channel '$channel_name': ${EVAL_ERROR}";
+    }
+  }
+
+  die "Caught a signal $signal";
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-sideload-relay - a program to sideload relay logs on a MySQL slave
+
+=head1 SYNOPSIS
+
+Usage: st-sideload-relay [OPTION...] [DSN]
+
+st-sideload-relay sideloads relay logs on a MySQL slave
+
+Example:
+
+  st-sideload-relay
+
+  st-sideload-relay --channel-name=prod
+
+  st-sideload-relay -u mysql -h master1
+
+  st-sideload-relay u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-sideload-relay fetches binlog from master/source and sideloads it while
+stopping the io_thread.
+
+=head1 RISK
+
+This program takes over the work of replication I/O thread. DO NOT run:
+START SLAVE;
+or
+START SLAVE io_tread;
+while this program is running or YOU WILL CORRUPT YOUR REPLICATION STREAM AND YOUR DATA!
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--initial-prefetch>
+
+type: size; default: 2G
+
+The size limit for fetching the initial binlog.
+
+=item B<--io-thread-threshold>
+
+type: size; default: 1G
+
+Keep prefetching the next batch of binlog until Exec_Master_Log_Pos and Master_Log_File
+are this amount of data away from the end of the available relay logs.
+
+=item B<--channel-name>
+
+short form: -c; type: string
+
+The name of the replication channel.
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--tmp-dir>
+
+Directory for storing temporary files.
+
+=item B<--master-info-file>
+
+default: master.info
+
+Location of master info file.
+
+=item B<--mysql-cli>
+
+default: mysql
+
+Name/Path of mysql cli.
+
+=item B<--mysqlbinlog-cli>
+
+default: mysqlbinlog
+
+Name/Path of mysqlbinlog cli.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=cut

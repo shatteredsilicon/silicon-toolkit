@@ -1,0 +1,15 @@
+# REQUIREMENTS
+
+## Perl Module
+
+- English
+- DBI
+- DBD::mysql (for MySQL)
+- DBD::MariaDB (for MariaDB)
+- Config::IniFiles
+- Capture::Tiny
+
+## Replica User Privileges
+
+- REPLICATION CLIENT
+- REPLICATION SLAVE
