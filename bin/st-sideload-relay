@@ -40,7 +40,7 @@ sub new {
   my ( $class, $opt_str ) = @_;
 
   my $initial_prefetch = 2 * 1024 * 1024 * 1024; # default 2G
-  my $io_thread_threshold = 1024 * 1024 * 1024; # default 1G
+  my $io_thread_threshold = 2 * 1024 * 1024 * 1024; # default 2G
 
   my %options = (
     "initial-prefetch=s" => sub { my ($name, $value) = @_; my $val = parse_size_arg($name, $value); if (defined $val) { $initial_prefetch = $val; } else { pod2usage; } },
