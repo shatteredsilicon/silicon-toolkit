@@ -688,11 +688,19 @@ sub main {
         my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
           system("wc -c < ${relay_log}");
         };
-        if ($relay_log_size_exit ne 0) {
-          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
-          next EVENT;
+
+        if ($relay_log_size_exit == 0) {
+          $relay_log_space_size += $relay_log_size;
+          next;
         }
-        $relay_log_space_size += $relay_log_size;
+
+        # if the file is not present, we just ignore it
+        if ($relay_log_size_stderr =~ m/No such file/i) {
+          next;
+        }
+
+        warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
+        next EVENT;
       }
 
       STDEBUG && print "parsed relay log space size: ${relay_log_space_size}, limit: ${relay_log_space_limit}\n";
