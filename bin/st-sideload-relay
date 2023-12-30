@@ -439,7 +439,7 @@ sub main {
     }
 
     my $master_info_file_fh;
-    eval { open $master_info_file_fh, "<", $master_info_file };
+    eval { open($master_info_file_fh, "<", $master_info_file) or die "$!" };
     if ($EVAL_ERROR) {
       $db->disconnect() if $db;
       die "Can't open master.info file '${master_info_file}': ${EVAL_ERROR}";
@@ -673,7 +673,7 @@ sub main {
     my $relay_log_space_size = 0;
     if ($relay_log_space_limit > 0) {
       my $relay_log_fh;
-      eval { open $relay_log_fh, "<", $relay_log_index };
+      eval { open($relay_log_fh, "<", $relay_log_index) or die "$!" };
       if ($EVAL_ERROR) {
         warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
         next EVENT;
@@ -753,7 +753,7 @@ sub main {
         $trimed_binlog_size = $fetched_binlog_size;
       } else {
         my $fetched_binlog_fh;
-        eval { open $fetched_binlog_fh, '<:raw', "${fetched_binlog}" };
+        eval { open($fetched_binlog_fh, '<:raw', "${fetched_binlog}") or die "$!" };
         if ($EVAL_ERROR) {
           warn "Failed to open fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
           next EVENT;
@@ -823,7 +823,7 @@ sub main {
     }
 
     my $relay_log_fh;
-    eval { open $relay_log_fh, "<", $relay_log_index };
+    eval { open($relay_log_fh, "<", $relay_log_index) or die "$!" };
     if ($EVAL_ERROR) {
       warn "Can't open relay log index file '${relay_log_index}': ${EVAL_ERROR}";
       next EVENT;
