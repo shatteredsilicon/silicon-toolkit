@@ -731,7 +731,7 @@ sub main {
 
       my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
       my $fetched_binlog_size;
-      eval { $fetched_binlog_size = -s "${fetched_binlog}" };
+      eval { $fetched_binlog_size = (-s "${fetched_binlog}") or die "$!" };
       if ($EVAL_ERROR) {
         warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
         next EVENT;
@@ -744,6 +744,8 @@ sub main {
         # binlog file, we stop here
         last;
       }
+
+      $relay_log_space_size += $fetched_binlog_size;
 
       my $trimed_binlog_size;
       if ($pos eq 0) {
