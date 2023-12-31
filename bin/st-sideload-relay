@@ -685,22 +685,19 @@ sub main {
       foreach my $line (@relay_log_index_lines) {
         chomp $line;
         my $relay_log = catfile(dirname($relay_log_basename), basename($line));
-        my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
-          system("wc -c < ${relay_log}");
-        };
+        my $relay_log_size = 0;
+        eval { $relay_log_size = (-s "$relay_log") or die "$!" };
+        if ($EVAL_ERROR) {
+          # if the file is not present, we just ignore it
+          if ("$EVAL_ERROR" =~ m/No such file/i) {
+            next;
+          }
 
-        if ($relay_log_size_exit == 0) {
-          $relay_log_space_size += $relay_log_size;
-          next;
+          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
         }
 
-        # if the file is not present, we just ignore it
-        if ($relay_log_size_stderr =~ m/No such file/i) {
-          next;
-        }
-
-        warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
-        next EVENT;
+        $relay_log_space_size += $relay_log_size;
       }
 
       STDEBUG && print "parsed relay log space size: ${relay_log_space_size}, limit: ${relay_log_space_limit}\n";
