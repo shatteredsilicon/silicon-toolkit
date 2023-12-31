@@ -685,22 +685,19 @@ sub main {
       foreach my $line (@relay_log_index_lines) {
         chomp $line;
         my $relay_log = catfile(dirname($relay_log_basename), basename($line));
-        my ($relay_log_size, $relay_log_size_stderr, $relay_log_size_exit) = capture {
-          system("wc -c < ${relay_log}");
-        };
+        my $relay_log_size = 0;
+        eval { $relay_log_size = (-s "$relay_log") or die "$!" };
+        if ($EVAL_ERROR) {
+          # if the file is not present, we just ignore it
+          if ("$EVAL_ERROR" =~ m/No such file/i) {
+            next;
+          }
 
-        if ($relay_log_size_exit == 0) {
-          $relay_log_space_size += $relay_log_size;
-          next;
+          warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${EVAL_ERROR}";
+          next EVENT;
         }
 
-        # if the file is not present, we just ignore it
-        if ($relay_log_size_stderr =~ m/No such file/i) {
-          next;
-        }
-
-        warn "Failed to get file size of relay log '${relay_log}' for channel '${channel_name}': ${relay_log_size_stderr}";
-        next EVENT;
+        $relay_log_space_size += $relay_log_size;
       }
 
       STDEBUG && print "parsed relay log space size: ${relay_log_space_size}, limit: ${relay_log_space_limit}\n";
@@ -734,7 +731,7 @@ sub main {
 
       my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
       my $fetched_binlog_size;
-      eval { $fetched_binlog_size = -s "${fetched_binlog}" };
+      eval { $fetched_binlog_size = (-s "${fetched_binlog}") or die "$!" };
       if ($EVAL_ERROR) {
         warn "Failed to get file size of fetched binlog '${fetched_binlog}' for channel '${channel_name}': ${EVAL_ERROR}";
         next EVENT;
@@ -747,6 +744,8 @@ sub main {
         # binlog file, we stop here
         last;
       }
+
+      $relay_log_space_size += $fetched_binlog_size;
 
       my $trimed_binlog_size;
       if ($pos eq 0) {
