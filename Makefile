@@ -1,5 +1,5 @@
 BUILDDIR	?= /tmp/ssmbuild
-VERSION		?= 3.5.7.1
+VERSION		?=
 RELEASE		?= 1
 
 ifeq (0, $(shell hash dpkg 2>/dev/null; echo $$?))
