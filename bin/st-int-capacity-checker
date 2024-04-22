@@ -49,7 +49,8 @@ sub new {
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "threshold=i" => \(my $threshold = 80),
     "schema=s" => \my $schema,
-    "verbose" => \my $verbose
+    "verbose" => \my $verbose,
+    "parallel=i" => \(my $parallel = 1)
   );
   GetOptions(
     %options
@@ -65,7 +66,8 @@ sub new {
       'mysql-cli' => $mysql_cli,
       'threshold' => $threshold,
       'schema' => $schema,
-      'verbose' => $verbose
+      'verbose' => $verbose,
+      'parallel' => $parallel
     },
   };
 
@@ -200,7 +202,7 @@ sub new {
   $args{attrs} ||= {};
 
   my $defaults = {
-    AutoCommit         => 0,
+    AutoCommit         => 1,
     RaiseError         => 1,
     PrintError         => 0,
     ShowErrorStatement => 1,
@@ -276,10 +278,10 @@ sub get_dbi_dsn {
   my $socket_opt;
   eval{ require DBD::MariaDB };
   if ($@) {
-    $dsn = "DBI:mysql:";
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
     $socket_opt = 'socket';
   } else {
-    $dsn = "DBI:MariaDB:";
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
     $socket_opt = 'mariadb_socket';
   };
 
@@ -314,6 +316,7 @@ use Capture::Tiny ':all';
 use Term::ANSIColor qw(colored);
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 use Text::Table;
+use Parallel::ForkManager;
 
 sub main {
   my @ARGV = @_;
@@ -326,12 +329,15 @@ sub main {
     port => $o->get_option('port'),
     socket => $o->get_option('socket'),
     user => $o->get_option('user'),
-    password => $o->get_option('password'),
+    password => $o->get_option('password')
   );
 
   my $schema = $o->get_option('schema');
   my $threshold = $o->get_option('threshold');
   my $verbose = $o->get_option('verbose');
+  my $parallel = $o->get_option('parallel');
+
+  my $pm = Parallel::ForkManager->new($parallel);
 
   # get list of schemas to be checked
   my @schemas = ();
@@ -346,8 +352,6 @@ sub main {
   }
 
   STDEBUG && print "Schemas to be checked: " . join(", ", @schemas) . "\n";
-
-  my @text_tables = ();
 
   foreach my $sm (@schemas) {
     STDEBUG && print "Checking schema `${sm}`...\n";
@@ -366,64 +370,77 @@ sub main {
     foreach my $table (@tables) {
       STDEBUG && print "Checking table `${sm}`.`${table}`...\n";
 
-      my @columns = ();
-      eval { @columns = @{$db->{dbh}->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $db->{dbh}->quote("$sm") . " AND TABLE_NAME = " . $db->{dbh}->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'")} };
-      if ($EVAL_ERROR) {
-        print "Can't get column list of table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
-        next;
+      my $dbh;
+      if ($parallel > 1) {
+        $pm->start and next;
+
+        $dbh = $db->{dbh}->clone();
+        $db->{dbh}->{InactiveDestroy} = 1;
+      } else {
+        $dbh = $db->{dbh};
       }
 
-      STDEBUG && print Dumper(@columns);
-
-      if ((scalar @columns) eq 0) {
-        next;
-      }
-
-      my @max_values = ();
-      eval { @max_values = @{$db->{dbh}->selectrow_arrayref("SELECT " . join(", ", map { "MAX(`" . $_->[0] . "`)" } @columns) . " FROM `${sm}`.`${table}`")} };
-      if ($EVAL_ERROR) {
-        print "Can't get maximum values of columns " . join(",", map {$_->[0]} @columns) . ": ${EVAL_ERROR}\n";
-        next;
-      }
-
-      my @titles = ('');
-      my @samples = ("${sm}.${table}");
-      my $exceed_threshold = 0;
-
-      foreach my $i (0 .. $#columns) {
-        my $max_value = 2147483647;
-        if ($columns[$i]->[1]) {
-          $max_value = 4294967295;
+      &{ sub {
+        my @columns = ();
+        eval { @columns = @{$dbh->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $dbh->quote("$sm") . " AND TABLE_NAME = " . $dbh->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'")} };
+        if ($EVAL_ERROR) {
+          print "Can't get column list of table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
+          return;
         }
 
-        my $title = $columns[$i]->[0] . ($columns[$i]->[1] ? " (u)" : " (s)"),
-        my $sample = '' . ($max_values[$i] || 0);
-        if ((($max_values[$i] || 0) / $max_value) >= ($threshold / 100)) {
-          $title = colored(['red'], $title);
-          $sample = colored(['red'], $sample);
-          $exceed_threshold = 1;
+        STDEBUG && print Dumper(@columns);
 
-          push @titles, $title;
-          push @samples, $sample;
-        } elsif ($verbose) {
-          push @titles, $title;
-          push @samples, $sample;
+        if ((scalar @columns) eq 0) {
+          return;
         }
+
+        my @max_values = ();
+        eval { @max_values = @{$dbh->selectrow_arrayref("SELECT " . join(", ", map { "MAX(`" . $_->[0] . "`)" } @columns) . " FROM `${sm}`.`${table}`")} };
+        if ($EVAL_ERROR) {
+          print "Can't get maximum values of columns " . join(",", map {$_->[0]} @columns) . " for table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
+          return;
+        }
+
+        my @titles = ('');
+        my @samples = ("${sm}.${table}");
+        my $exceed_threshold = 0;
+
+        foreach my $i (0 .. $#columns) {
+          my $max_value = 2147483647;
+          if ($columns[$i]->[1]) {
+            $max_value = 4294967295;
+          }
+
+          my $title = $columns[$i]->[0] . ($columns[$i]->[1] ? " (u)" : " (s)"),
+          my $sample = '' . ($max_values[$i] || 0);
+          if ((($max_values[$i] || 0) / $max_value) >= ($threshold / 100)) {
+            $title = colored(['red'], $title);
+            $sample = colored(['red'], $sample);
+            $exceed_threshold = 1;
+
+            push @titles, $title;
+            push @samples, $sample;
+          } elsif ($verbose) {
+            push @titles, $title;
+            push @samples, $sample;
+          }
+        }
+
+        # none of columns in this table exceeds threshold, ignore it
+        if (! $exceed_threshold) { return; };
+
+        my $tb = Text::Table->new(@titles);
+        $tb->load([@samples]);
+        print $tb . "\n";
+      } }();
+
+      if ($parallel > 1) {
+        $pm->finish;
       }
-
-      # none of columns in this table exceeds threshold, ignore it
-      if (! $exceed_threshold) { next; };
-
-      my $tb = Text::Table->new(@titles);
-      $tb->load([@samples]);
-      push @text_tables, $tb;
     }
   }
 
-  foreach my $tb (@text_tables) {
-    print $tb . "\n";
-  }
-
+  $pm->wait_all_children;
   $db->disconnect() if $db;
   return 0;
 }
@@ -484,6 +501,12 @@ The schema to be checked
 type: integer; default: 80
 
 Only show the column that its maximum value exceeds this threshold (percent)
+
+=item B<--parallel>
+
+type: parallel; default: 1
+
+Run the check progress in parallel
 
 =item B<--user>
 
