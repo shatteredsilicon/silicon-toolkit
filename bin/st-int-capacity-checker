@@ -350,7 +350,11 @@ sub main {
     STDEBUG && print "Checking schema `${sm}`...\n";
 
     my @tables = ();
-    eval { @tables = @{$db->{dbh}->selectcol_arrayref("SHOW TABLES FROM `${sm}`")} };
+    eval { @tables = @{$db->{dbh}->selectcol_arrayref(
+        " SELECT TABLES.TABLE_NAME
+          FROM   information_schema.TABLES
+          WHERE  TABLES.TABLE_SCHEMA = '${sm}' AND
+                 TABLE_TYPE != 'VIEW'")} };
     if ($EVAL_ERROR) {
       print "Can't get table list of schema `${sm}`: ${EVAL_ERROR}\n";
       next;
