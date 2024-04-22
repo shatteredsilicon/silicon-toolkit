@@ -47,7 +47,7 @@ sub new {
     "socket|S=s" => \my $socket,
     "port|P=i" => \(my $port = 3306),
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
-    "threshold=i" => \(my $threshold = 0),
+    "threshold=i" => \(my $threshold = 80),
     "schema=s" => \my $schema
   );
   GetOptions(
@@ -456,7 +456,7 @@ Default credentials are read from the following files in the given order:
 
 st-int-capacity-checker walks throught all tables in all schemas (or a specify schema
 if --schema option is used), check if maximum value of a int column has exceeded the
-threshold (defaults to 0) of the column's maximum (2147483648 for signed,
+threshold (defaults to 80) of the column's maximum (2147483648 for signed,
 4294967295 for unsigned)
 
 =head1 OPTIONS
@@ -471,7 +471,7 @@ The schema to be checked
 
 =item B<--threshold>
 
-type: integer; default: 0
+type: integer; default: 80
 
 Only show the column that its maximum value exceeds this threshold (percent)
 
