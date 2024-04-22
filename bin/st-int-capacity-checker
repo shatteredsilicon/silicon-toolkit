@@ -1,0 +1,522 @@
+#!/usr/bin/env perl
+
+# This is st-int-capacity-checker, a program to check capacity of
+# int clumns in a MySQL table.
+#
+# Copyright (C) 2024  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class, $opt_str ) = @_;
+
+  my %options = (
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
+    "threshold=i" => \(my $threshold = 0),
+    "schema=s" => \my $schema
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+
+  my $self = {
+    args => {
+      'user' => $user,
+      'password' => $password,
+      'host' => $host,
+      'socket' => $socket,
+      'port' => $port,
+      'mysql-cli' => $mysql_cli,
+      'threshold' => $threshold,
+      'schema' => $schema
+    },
+  };
+
+  if (defined $opt_str) {
+    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              $self->{args}->{$primary_name} = $opt_val;
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    STDEBUG && print $conf_file . "\n";
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file" )) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # read default socket path from output of
+  # 'mysql --print-defaults'
+  my $mysqlbinlog_cli = $self->get_option('mysql-cli');
+  open FH, "${mysqlbinlog_cli} --print-defaults |";
+	my @lines = <FH>;
+	close FH;
+
+  foreach my $line (@lines) {
+    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
+      $self->{args}->{socket} = "$path";
+      last;
+    }
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 0,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if ($socket) {
+    $dsn = "${dsn};${socket_opt}=${socket};";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host};";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_int_capacity_checker program.
+# ############################################################################
+package st_int_capacity_checker;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Capture::Tiny ':all';
+use Term::ANSIColor qw(colored);
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+use Text::Table;
+
+sub main {
+  my @ARGV = @_;
+
+  my $o = new Option(shift @ARGV);
+  $o->parse_dsn();
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $o->get_option('password'),
+  );
+
+  my $schema = $o->get_option('schema');
+  my $threshold = $o->get_option('threshold');
+
+  # get list of schemas to be checked
+  my @schemas = ();
+  if ($schema) {
+    push @schemas, $schema;
+  } else {
+    eval { @schemas = @{$db->{dbh}->selectcol_arrayref("SHOW DATABASES")} };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get schema list: ${EVAL_ERROR}";
+    }
+  }
+
+  STDEBUG && print "Schemas to be checked: " . join(", ", @schemas) . "\n";
+
+  my @text_tables = ();
+
+  foreach my $sm (@schemas) {
+    STDEBUG && print "Checking schema `${sm}`...\n";
+
+    my @tables = ();
+    eval { @tables = @{$db->{dbh}->selectcol_arrayref("SHOW TABLES FROM `${sm}`")} };
+    if ($EVAL_ERROR) {
+      print "Can't get table list of schema `${sm}`: ${EVAL_ERROR}\n";
+      next;
+    }
+
+    foreach my $table (@tables) {
+      STDEBUG && print "Checking table `${sm}`.`${table}`...\n";
+
+      my @columns = ();
+      eval { @columns = @{$db->{dbh}->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '${sm}' AND TABLE_NAME = '${table}' AND COLUMN_TYPE LIKE 'int\%'")} };
+      if ($EVAL_ERROR) {
+        print "Can't get column list of table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
+        next;
+      }
+
+      STDEBUG && print Dumper(@columns);
+
+      if ((scalar @columns) eq 0) {
+        next;
+      }
+
+      my @max_values = ();
+      eval { @max_values = @{$db->{dbh}->selectrow_arrayref("SELECT " . join(", ", map { "MAX(`" . $_->[0] . "`)" } @columns) . " FROM `${sm}`.`${table}`")} };
+      if ($EVAL_ERROR) {
+        print "Can't get maximum values of columns " . join(",", map {$_->[0]} @columns) . ": ${EVAL_ERROR}\n";
+        next;
+      }
+
+      my @titles = ('');
+      my @samples = ("${sm}.${table}");
+      my $exceed_threshold = 0;
+
+      foreach my $i (0 .. $#columns) {
+        my $max_value = 2147483647;
+        if ($columns[$i]->[1]) {
+          $max_value = 4294967295;
+        }
+
+        my $title = $columns[$i]->[0] . ($columns[$i]->[1] ? " (u)" : " (s)"),
+        my $sample = '' . ($max_values[$i] || 0);
+        if ((($max_values[$i] || 0) / $max_value) >= ($threshold / 100)) {
+          $title = colored(['red'], $title);
+          $sample = colored(['red'], $sample);
+          $exceed_threshold = 1;
+        }
+
+        push @titles, $title;
+        push @samples, $sample;
+      }
+
+      # none of columns in this table exceeds threshold, ignore it
+      if (! $exceed_threshold) { next; };
+
+      my $tb = Text::Table->new(@titles);
+      $tb->load([@samples]);
+      push @text_tables, $tb;
+    }
+  }
+
+  foreach my $tb (@text_tables) {
+    print $tb . "\n";
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-int-capacity-checker - a program to check capacity of int clumns in a MySQL table.
+
+=head1 SYNOPSIS
+
+Usage: st-int-capacity-checker [OPTION...] [DSN]
+
+st-int-capacity-checker checks capacity of int clumns in a MySQL table.
+
+Example:
+
+  st-int-capacity-checker
+
+  st-int-capacity-checker -u mysql -h localhost
+
+  st-int-capacity-checker u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-int-capacity-checker walks throught all tables in all schemas (or a specify schema
+if --schema option is used), check if maximum value of a int column has exceeded the
+threshold (defaults to 0) of the column's maximum (2147483648 for signed,
+4294967295 for unsigned)
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--schema>
+
+type: string
+
+The schema to be checked
+
+=item B<--threshold>
+
+type: integer; default: 0
+
+Only show the column that its maximum value exceeds this threshold (percent)
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--mysql-cli>
+
+default: mysql
+
+Name/Path of mysql cli.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=cut
