@@ -354,7 +354,7 @@ sub main {
         " SELECT TABLES.TABLE_NAME
           FROM   information_schema.TABLES
           WHERE  TABLES.TABLE_SCHEMA = '${sm}' AND
-                 TABLE_TYPE != 'VIEW'")} };
+                 TABLE_TYPE = 'BASE TABLE'")} };
     if ($EVAL_ERROR) {
       print "Can't get table list of schema `${sm}`: ${EVAL_ERROR}\n";
       next;
