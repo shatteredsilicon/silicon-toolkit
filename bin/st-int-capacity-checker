@@ -48,7 +48,8 @@ sub new {
     "port|P=i" => \(my $port = 3306),
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "threshold=i" => \(my $threshold = 80),
-    "schema=s" => \my $schema
+    "schema=s" => \my $schema,
+    "verbose" => \my $verbose
   );
   GetOptions(
     %options
@@ -63,7 +64,8 @@ sub new {
       'port' => $port,
       'mysql-cli' => $mysql_cli,
       'threshold' => $threshold,
-      'schema' => $schema
+      'schema' => $schema,
+      'verbose' => $verbose
     },
   };
 
@@ -329,6 +331,7 @@ sub main {
 
   my $schema = $o->get_option('schema');
   my $threshold = $o->get_option('threshold');
+  my $verbose = $o->get_option('verbose');
 
   # get list of schemas to be checked
   my @schemas = ();
@@ -399,10 +402,13 @@ sub main {
           $title = colored(['red'], $title);
           $sample = colored(['red'], $sample);
           $exceed_threshold = 1;
-        }
 
-        push @titles, $title;
-        push @samples, $sample;
+          push @titles, $title;
+          push @samples, $sample;
+        } elsif ($verbose) {
+          push @titles, $title;
+          push @samples, $sample;
+        }
       }
 
       # none of columns in this table exceeds threshold, ignore it
@@ -514,6 +520,12 @@ Server listen port.
 default: mysql
 
 Name/Path of mysql cli.
+
+=item B<--verbose>
+
+type: boolean; default: false
+
+Whether to show all columns from a table
 
 =item B<--help>
 
