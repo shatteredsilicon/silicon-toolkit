@@ -125,7 +125,7 @@ sub parse_dsn {
       next;
     }
 
-    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file" )) {
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file", -php_compat => 1 )) {
       if (!defined $ini{client}) {
         next;
       }
