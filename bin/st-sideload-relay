@@ -51,7 +51,7 @@ sub new {
     "host|h=s" => \my $host,
     "socket|S=s" => \my $socket,
     "port|P=i" => \(my $port = 3306),
-    "tmp-dir=s" => \(my $tmp_dir = '/tmp'),
+    "tmp-dir=s" => \my $tmp_dir,
     "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
     "mysql-cli" => \(my $mysql_cli = 'mysql'),
     "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog')
@@ -381,10 +381,15 @@ sub main {
   my $channel_name = $o->get_option('channel-name');
   my $initial_prefetch = $o->get_option('initial-prefetch');
   my $io_thread_threshold = $o->get_option('io-thread-threshold');
-  my $tmp_dir = $o->get_option('tmp-dir');
+  my $option_tmp_dir = $o->get_option('tmp-dir');
   my $master_info_file = $o->get_option('master-info-file');
   my $mysql_cli = $o->get_option('mysql-cli');
   my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
+
+  my $tmp_binlog_prefix = ".stsr-";
+  if (defined $channel_name && length $channel_name) {
+    $tmp_binlog_prefix = "${tmp_binlog_prefix}${channel_name}-";
+  }
 
   my $mysql_version;
   eval { $mysql_version = $db->{dbh}->selectrow_arrayref('SELECT @@version')->[0] };
@@ -659,6 +664,12 @@ sub main {
       }
     }
 
+    # use relay log directory if value of --tmp-dir is not passed
+    my $tmp_dir = $option_tmp_dir;
+    if (!defined $option_tmp_dir || !$option_tmp_dir) {
+      $tmp_dir = dirname($relay_log_basename);
+    }
+
     my $relay_log_index = $channel_name eq '' ? "${relay_log_basename}.index" : "${relay_log_basename}-${channel_name}.index";
 
     STDEBUG && print "parsed relay log index file '$relay_log_index' for channel '${channel_name}'\n";
@@ -720,7 +731,19 @@ sub main {
 
       STDEBUG && print "fetching binlog '$master_log_file' at position '$pos' from server -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password}\n";
 
-      my $result_file_prefix = catfile($tmp_dir, "/");
+      my $result_file_prefix = catfile($tmp_dir, $tmp_binlog_prefix);
+      my $fetched_binlog = "$result_file_prefix" . "$master_log_file";
+      if ( -e "$fetched_binlog" ) {
+        # stop if expected file already exists,
+        # we don't want to accidentally override any file
+        if ((scalar @fetched_binlog_files) eq 0) {
+          warn "Aborted before trying to fetch binlog into file '${fetched_binlog}': file already exists, consider using '--tmp-dir' option to specify another directory";
+          last EVENT;
+        } else {
+          last;
+        }
+      }
+
       my ($mysqlbinlog_output, $mysqlbinlog_stderr, $mysqlbinlog_exit) = capture {
         system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=${result_file_prefix} --start-position=$pos $master_log_file");
       };
@@ -729,7 +752,6 @@ sub main {
         next EVENT;
       }
 
-      my $fetched_binlog = catfile($tmp_dir, "$master_log_file");
       my $fetched_binlog_size;
       eval { $fetched_binlog_size = (-s "${fetched_binlog}") or die "$!" };
       if ($EVAL_ERROR) {
@@ -742,7 +764,12 @@ sub main {
       if ($relay_log_space_limit gt 0 && ($relay_log_space_size + $fetched_binlog_size) > $relay_log_space_limit) {
         # it will exceed relay log space limit if we take this
         # binlog file, we stop here
-        last;
+        if ((scalar @fetched_binlog_files) eq 0) {
+          warn "exiting because it will exceeds relay log space limit if continue\n";
+          last EVENT;
+        } else {
+          last;
+        }
       }
 
       $relay_log_space_size += $fetched_binlog_size;
@@ -759,7 +786,7 @@ sub main {
         }
 
         my $info_event_bytes = '';
-        my $ok = read $fetched_binlog_fh, $info_event_bytes, 17; # lenght is 4 bytes, offset 4 magic bytes and another 9 bytes as part of the first info event header
+        my $ok = read $fetched_binlog_fh, $info_event_bytes, 17; # length is 4 bytes, offset 4 magic bytes and another 9 bytes as part of the first info event header
         close $fetched_binlog_fh;
 
         if (!defined $ok || !$ok || length($info_event_bytes) ne 17 ) {
@@ -767,7 +794,7 @@ sub main {
           next EVENT;
         }
 
-        STDEBUG && print "parsed lenght bytes of first info log event: ${info_event_bytes}\n";
+        STDEBUG && print "parsed length bytes of first info log event: ${info_event_bytes}\n";
 
         my $info_event_len = 0;
         my $bit_offset = 0;
@@ -777,9 +804,9 @@ sub main {
           $bit_offset += 8;
         }
 
-        STDEBUG && print "parsed lenght of first info log event: ${info_event_len}\n";
+        STDEBUG && print "parsed length of first info log event: ${info_event_len}\n";
 
-        $trimed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and lenght of first info event 
+        $trimed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and length of first info event 
       }
       $master_pos_offset += $trimed_binlog_size;
       push(@fetched_binlog_files, $fetched_binlog);
@@ -790,11 +817,6 @@ sub main {
         STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
         last;
       }
-    }
-
-    if ((scalar @fetched_binlog_files) eq 0) {
-      warn "exiting because it will exceeds relay log space limit if continue\n";
-      last EVENT;
     }
 
     STDEBUG && print "stopping sql_thread for channel '${channel_name}'\n";
@@ -838,7 +860,7 @@ sub main {
       my $relay_log = catfile(dirname($relay_log_basename), basename($relay_log_index_lines[-2-$#fetched_binlog_files+$i]));
       STDEBUG && print "overwriting ${relay_log} with ${fetched_binlog}\n";
       my ($overwrite_relay_output, $overwrite_relay_stderr, $overwrite_relay_exit) = capture {
-        system("cp ${fetched_binlog} ${relay_log}");
+        system("mv ${fetched_binlog} ${relay_log}");
       };
       if ($overwrite_relay_exit ne 0) {
         warn "Failed to overwrite latest relay log ${relay_log} with fetched binlog ${fetched_binlog} for channel '${channel_name}': ${overwrite_relay_stderr}";
