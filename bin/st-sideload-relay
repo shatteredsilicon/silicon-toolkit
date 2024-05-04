@@ -54,7 +54,8 @@ sub new {
     "tmp-dir=s" => \my $tmp_dir,
     "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
     "mysql-cli" => \(my $mysql_cli = 'mysql'),
-    "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog')
+    "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog'),
+    "lock-file=s" => \my $lock_file
   );
   GetOptions(
     %options
@@ -73,7 +74,8 @@ sub new {
       'tmp-dir' => $tmp_dir,
       'master-info-file' => $mariadb_master_info_file,
       'mysql-cli' => $mysql_cli,
-      'mysqlbinlog-cli' => $mysqlbinlog_cli
+      'mysqlbinlog-cli' => $mysqlbinlog_cli,
+      "lock-file" => $lock_file
     },
   };
 
@@ -343,6 +345,7 @@ use Data::Dumper;
 use File::Basename;
 use File::Spec::Functions 'catfile', 'file_name_is_absolute';
 use Capture::Tiny ':all';
+use Fcntl qw(:flock);
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 my @CLI_SSL_TLS_ARGS = ('ssl-ca', 'ssl-capath', 'ssl-cert', 'ssl-cipher', 'ssl-key', 'ssl-crl', 'ssl-crlpath', 'tls-version', 'tls-ciphersuites');
@@ -385,6 +388,18 @@ sub main {
   my $master_info_file = $o->get_option('master-info-file');
   my $mysql_cli = $o->get_option('mysql-cli');
   my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
+  my $lock_file = $o->get_option('lock-file');
+
+  if (!defined $lock_file || $lock_file eq "") {
+    $lock_file = "/var/lock/stsr";
+    if (defined $channel_name && length $channel_name) {
+      $lock_file = "${lock_file}-${channel_name}";
+    }
+    $lock_file = "$lock_file.lock";
+  }
+
+  open my $lock_file_handler, ">", "$lock_file" or die "Can't open lock file '$lock_file': $!";
+  flock $lock_file_handler, LOCK_EX|LOCK_NB or die "Aborted because there seems to be another process running";
 
   my $tmp_binlog_prefix = ".stsr-";
   if (defined $channel_name && length $channel_name) {
@@ -1044,6 +1059,10 @@ Server listen port.
 =item B<--tmp-dir>
 
 Directory for storing temporary files.
+
+=item B<--lock-file>
+
+Lock file to use
 
 =item B<--master-info-file>
 
