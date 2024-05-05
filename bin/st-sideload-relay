@@ -53,8 +53,8 @@ sub new {
     "port|P=i" => \(my $port = 3306),
     "tmp-dir=s" => \my $tmp_dir,
     "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
-    "mysql-cli" => \(my $mysql_cli = 'mysql'),
-    "mysqlbinlog-cli" => \(my $mysqlbinlog_cli = 'mysqlbinlog'),
+    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
+    "mysqlbinlog-cli=s" => \(my $mysqlbinlog_cli = 'mysqlbinlog'),
     "lock-file=s" => \my $lock_file
   );
   GetOptions(
