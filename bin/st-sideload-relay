@@ -39,7 +39,7 @@ use constant STDEBUG => $ENV{STDEBUG} || 0;
 sub new {
   my ( $class, $opt_str ) = @_;
 
-  my $initial_prefetch = 2 * 1024 * 1024 * 1024; # default 2G
+  my $initial_prefetch;
   my $io_thread_threshold = 2 * 1024 * 1024 * 1024; # default 2G
 
   my %options = (
@@ -828,7 +828,7 @@ sub main {
       $latest_master_log_file = $master_log_file;
       $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimed_binlog_size : $trimed_binlog_size;
 
-      if ( !$initial_run || $master_pos_offset > $initial_prefetch ) {
+      if ( !$initial_run || !defined $initial_prefetch || $initial_prefetch == 0 || $master_pos_offset > $initial_prefetch ) {
         STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
         last;
       }
