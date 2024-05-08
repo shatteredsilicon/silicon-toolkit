@@ -56,7 +56,8 @@ sub new {
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "mysqlbinlog-cli=s" => \(my $mysqlbinlog_cli = 'mysqlbinlog'),
     "lock-file=s" => \my $lock_file,
-    "verbose|v" => \my $verbose
+    "verbose|v" => \my $verbose,
+    "min-lag=i" => \(my $min_lag = 5)
   );
   GetOptions(
     %options
@@ -77,7 +78,8 @@ sub new {
       'mysql-cli' => $mysql_cli,
       'mysqlbinlog-cli' => $mysqlbinlog_cli,
       "lock-file" => $lock_file,
-      "verbose" => $verbose
+      "verbose" => $verbose,
+      "min-lag" => $min_lag
     },
   };
 
@@ -392,6 +394,7 @@ sub main {
   my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
   my $lock_file = $o->get_option('lock-file');
   my $verbose = $o->get_option('verbose');
+  my $min_lag = $o->get_option('min-lag');
 
   if (!defined $lock_file || $lock_file eq "") {
     $lock_file = "/var/lock/stsr";
@@ -533,10 +536,20 @@ sub main {
 
   # get initial slave status
   my $init_slave_status;
-  eval { $init_slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
-  if ($EVAL_ERROR) {
-    $db->disconnect() if $db;
-    die "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+  while (1) {
+    eval { $init_slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+    }
+
+    if (defined $init_slave_status->{Seconds_Behind_Master} && $init_slave_status->{Seconds_Behind_Master} < $min_lag) {
+      $verbose && warn "sleeping 10s because Seconds_Behind_Master = $init_slave_status->{Seconds_Behind_Master} is lower than min-lag = $min_lag\n";
+      sleep 10;
+      next;
+    }
+
+    last;
   }
 
   $SIG{INT} = sub { my ($signal) = @_; terminate_handler($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg); };
@@ -1058,6 +1071,12 @@ Directory for storing temporary files.
 =item B<--lock-file>
 
 Lock file to use
+
+=item B<--min-lag>
+
+type: integer
+
+Them minimum lag (seconds) for it to start sideloading.
 
 =item B<--master-info-file>
 
