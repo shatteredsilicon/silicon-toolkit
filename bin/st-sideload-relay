@@ -899,16 +899,6 @@ sub main {
 
     $initial_run = 0;
 
-    # remove those fetched temporary binlog files
-    foreach my $fetched_binlog ( @fetched_binlog_files ) {
-      my ($remove_fetched_binlog_output, $remove_fetched_binlog_stderr, $remove_fetched_binlog_exit) = capture {
-        system("rm -f ${fetched_binlog}");
-      };
-      if ($remove_fetched_binlog_exit ne 0) {
-        warn "Failed to delete fetched binlog file '${fetched_binlog}' for channel '$channel_name': ${remove_fetched_binlog_stderr}";
-      }
-    }
-
     STDEBUG && print "starting sql_thread for channel '${channel_name}'\n";
 
     eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} sql_thread ${mysql_channel_arg}") };
