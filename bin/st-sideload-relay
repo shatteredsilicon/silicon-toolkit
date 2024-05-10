@@ -778,7 +778,7 @@ sub main {
       }
 
       my ($mysqlbinlog_output, $mysqlbinlog_stderr, $mysqlbinlog_exit) = capture {
-        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --read-from-remote-server --raw --result-file=${result_file_prefix} --start-position=$pos $master_log_file");
+        system("${mysqlbinlog_cli} -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} --verify-binlog-checksum --read-from-remote-server --raw --result-file=${result_file_prefix} --start-position=$pos $master_log_file");
       };
       if ($mysqlbinlog_exit ne 0) {
         warn "Failed to fetch binlog from master for channel '${channel_name}': ${mysqlbinlog_stderr}";
