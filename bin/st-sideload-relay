@@ -55,7 +55,8 @@ sub new {
     "master-info-file" => \(my $mariadb_master_info_file = 'master.info'),
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "mysqlbinlog-cli=s" => \(my $mysqlbinlog_cli = 'mysqlbinlog'),
-    "lock-file=s" => \my $lock_file
+    "lock-file=s" => \my $lock_file,
+    "verbose|v" => \my $verbose
   );
   GetOptions(
     %options
@@ -75,7 +76,8 @@ sub new {
       'master-info-file' => $mariadb_master_info_file,
       'mysql-cli' => $mysql_cli,
       'mysqlbinlog-cli' => $mysqlbinlog_cli,
-      "lock-file" => $lock_file
+      "lock-file" => $lock_file,
+      "verbose" => $verbose
     },
   };
 
@@ -389,6 +391,7 @@ sub main {
   my $mysql_cli = $o->get_option('mysql-cli');
   my $mysqlbinlog_cli = $o->get_option('mysqlbinlog-cli');
   my $lock_file = $o->get_option('lock-file');
+  my $verbose = $o->get_option('verbose');
 
   if (!defined $lock_file || $lock_file eq "") {
     $lock_file = "/var/lock/stsr";
@@ -651,7 +654,9 @@ sub main {
     }
 
     if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
-      warn "sleeping 10s because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      if ($verbose) {
+        warn "sleeping 10s because it reaches io-thread-threshold, io-thread-threshold: ${io_thread_threshold}, distance to current end of relay log: ${exec_read_pos_offset}\n";
+      }
       sleep 9;
       next EVENT;
     }
@@ -1079,5 +1084,9 @@ Print a brief help message and exits.
 =item B<--version>
 
 Show version and exit.
+
+=item B<--verbose>
+
+Whether to show verbose messages.
 
 =cut
