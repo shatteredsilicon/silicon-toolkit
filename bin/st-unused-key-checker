@@ -374,6 +374,18 @@ sub main {
   my $show_usage_for_all_indexes = $o->get_option('show-usage-for-all-indexes');
   my $show_sql = $o->get_option('sql');
 
+  my $userstat_row;
+  eval { $userstat_row = $db->{dbh}->selectrow_arrayref("SHOW GLOBAL VARIABLES LIKE 'userstat'") };
+  if ($EVAL_ERROR) {
+    die "Can't get userstatus: ${EVAL_ERROR}";
+  }
+  if (!defined $userstat_row) {
+    die "This tool only works on Percona MySQL and MariaDB, which have the User Statistics (userstat) plugin";
+  }
+  if (!$userstat_row->[1]) {
+    die "'userstat' must be set 1 for this tool to work";
+  }
+
   my $uptime;
   eval { $uptime = $db->{dbh}->selectrow_arrayref("SHOW GLOBAL STATUS LIKE 'Uptime'")->[1] };
   if ($EVAL_ERROR) {
@@ -406,17 +418,67 @@ LEFT JOIN	information_schema.index_statistics ON
 
   my @or_where_clauses = ();
   if (defined $databases && (scalar @{$databases}) > 0) {
-    push(@or_where_clauses, 'statistics.table_schema IN (' . join(', ', map { $db->{dbh}->quote("$_") } @{$databases}) . ')' );
+    my $in_str = 'IN (' . join(', ', map { $db->{dbh}->quote("$_") } @{$databases}) . ')';
+    push(@or_where_clauses,  "statistics.table_schema $in_str");
+
+    my $schemas;
+    eval { $schemas = $db->{dbh}->selectcol_arrayref("
+      SELECT schema_name
+      FROM information_schema.SCHEMATA
+      WHERE schema_name $in_str
+    ") };
+    if ($EVAL_ERROR) {
+      die "Can't get schema list with @{$databases}: ${EVAL_ERROR}";
+    }
+
+    foreach my $tmp_database (@{$databases}) {
+      my $exists = 0;
+      foreach my $tmp_schema (@{$schemas}) {
+        if ("$tmp_database" eq "$tmp_schema") {
+          $exists = 1;
+          last;
+        }
+      }
+      if (!$exists) {
+        die "Database '$tmp_database' doesn't exist";
+      }
+    }
   }
 
   if (defined $tables && (scalar @{$tables}) > 0) {
-    push(@or_where_clauses, '( ' . join(' OR ', map {
-      my ($schema_or_tbl, $tbl) = split('\.', "$_", 2);
-      if ( defined $tbl && $tbl eq '' ) { die "table name in '$_' is not given" };
-      defined $tbl && defined $schema_or_tbl && $schema_or_tbl ne ''
-        ? '( statistics.table_schema = ' . $db->{dbh}->quote("$schema_or_tbl") . ' AND statistics.table_name = ' . $db->{dbh}->quote("$tbl") . ' )'
-        : 'statistics.table_name = ' . $db->{dbh}->quote("$schema_or_tbl")
-    } @{$tables}) . ' )');
+    my @mapped_strs = ();
+    foreach my $table (@{$tables}) {
+      my ($schema_or_tbl, $tbl) = split('\.', "$table", 2);
+      if ( defined $tbl && $tbl eq '' ) { die "table name in '$table' is not given" };
+
+      my $table_exists;
+      if (defined $tbl && defined $schema_or_tbl && $schema_or_tbl ne '') {
+        my $fmt_str = '( %s.table_schema = ' . $db->{dbh}->quote("$schema_or_tbl") . ' AND %s.table_name = ' . $db->{dbh}->quote("$tbl") . ' )';
+        push(@mapped_strs, sprintf("$fmt_str", "statistics", "statistics"));
+        eval { $table_exists = $db->{dbh}->selectcol_arrayref("
+          SELECT 1
+          FROM information_schema.TABLES
+          WHERE " . sprintf("$fmt_str", "TABLES", "TABLES") . " AND TABLE_TYPE = 'BASE TABLE'
+          LIMIT 1
+        ")->[0] };
+      } else {
+        my $fmt_str = 'table_name = ' . $db->{dbh}->quote("$schema_or_tbl");
+        push(@mapped_strs, 'statistics.' . "$fmt_str");
+        eval { $table_exists = $db->{dbh}->selectcol_arrayref("
+          SELECT 1
+          FROM information_schema.TABLES
+          WHERE $fmt_str AND TABLE_TYPE = 'BASE TABLE'
+          LIMIT 1
+        ")->[0] };
+      }
+      if ($EVAL_ERROR) {
+        die "Can't check if table exists for '$table': $EVAL_ERROR";
+      }
+      if (!defined $table_exists || !$table_exists) {
+        die "BASE TABLE '$table' doesn't exists";
+      }
+    }
+    push(@or_where_clauses, '( ' . join(' OR ', @mapped_strs) . ' )');
   }
 
   my @and_where_clauses = ();
@@ -436,7 +498,7 @@ LEFT JOIN	information_schema.index_statistics ON
   }
 
   $sql = "$sql
-WHERE     (" . ($#or_where_clauses > 0 ? join(' OR ', @or_where_clauses) : "1") . ") AND (" . join(' AND ', @and_where_clauses) . ")
+WHERE     (" . ((scalar @or_where_clauses) > 0 ? join(' OR ', @or_where_clauses) : "1") . ") AND (" . join(' AND ', @and_where_clauses) . ")
 GROUP BY	statistics.table_schema,
           statistics.table_name,
           statistics.index_name";
@@ -511,11 +573,9 @@ ORDER BY	index_statistics.rows_read,
           next;
         }
 
-        if (defined $engines || defined $ignore_engines) {
-          my $engine = get_engine($db, $schema, $table);
-          if (!is_schema_table_engine_allowed($o, undef, undef, $engine)) {
-            next;
-          }
+        my $engine = get_engine($db, $schema, $table);
+        if (!is_schema_table_engine_allowed($o, undef, undef, $engine)) {
+          next;
         }
 
         printf $hdr_fmt, ('#' x $hdr_width);
@@ -523,12 +583,37 @@ ORDER BY	index_statistics.rows_read,
         printf $hdr_fmt, ('#' x $hdr_width);
         print "\n";
 
+        my $has_used_index;
         foreach my $index_row (@{$schema_table_indexes->{$schema}->{$table}}) {
           my $index_name = $index_row->{index_name};
           my $rows_read = defined $index_row->{rows_read} ? $index_row->{rows_read} : 0;
 
           printf $hdr_fmt, "$index_name is unused.";
-          if ($show_sql) {
+          if (!$show_sql) {
+            next;
+          }
+
+          if ("$engine" eq 'InnoDB' && "$index_name" eq 'PRIMARY') {
+            if (!defined $has_used_index) {
+              eval { $has_used_index = $db->{dbh}->selectcol_arrayref("
+                SELECT      COUNT(1)
+                FROM        information_schema.statistics
+                LEFT JOIN   information_schema.index_statistics ON
+                              statistics.table_schema = index_statistics.table_schema AND
+                              statistics.table_name = index_statistics.table_name AND
+                              statistics.index_name = index_statistics.index_name
+                WHERE statistics.table_schema = " . $db->{dbh}->quote("$schema") . " AND statistics.table_name = " . $db->{dbh}->quote("$table") . " AND index_statistics.rows_read > 0")->[0]
+              };
+              if ($EVAL_ERROR) {
+                die "Can't get used index from schema = $schema, table = $table: $EVAL_ERROR";
+              }
+            }
+            if ($has_used_index) {
+              printf $hdr_fmt, "PRIMARY key of $schema.$table is unused, but another key is used.\n";
+            } else {
+              print "DROP TABLE " . $db->{dbh}->quote_identifier(undef, $schema, $table) . ";\n\n";
+            }
+          } else {
             print "ALTER TABLE " . $db->{dbh}->quote_identifier(undef, $schema, $table) . " DROP INDEX " . $db->{dbh}->quote_identifier(undef, $index_name) . ";\n\n";
           }
         }
