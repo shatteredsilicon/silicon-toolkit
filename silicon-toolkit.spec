@@ -23,45 +23,35 @@ Shattered Silicon Toolkit
 mkdir -p %{_GOPATH}/bin
 export GOPATH=%{_GOPATH}
 
-go build -ldflags="-s -w" ./src/go/pt-mongodb-summary
-%{__cp} pt-mongodb-summary %{_GOPATH}/bin
-%{__cp} bin/pt-mysql-summary %{_GOPATH}/bin
-%{__cp} bin/pt-summary %{_GOPATH}/bin
-%{__cp} bin/pt-visual-explain %{_GOPATH}/bin
-%{__cp} bin/pt-archiver %{_GOPATH}/bin
+go install -ldflags="-s -w" ./src/go/...
+%{__cp} bin/* %{_GOPATH}/bin
 
 strip %{_GOPATH}/bin/* || true
 
 %install
 install -m 0755 -d $RPM_BUILD_ROOT/usr/bin
-install -m 0755 %{_GOPATH}/bin/pt-summary $RPM_BUILD_ROOT/usr/bin/st-summary
-install -m 0755 %{_GOPATH}/bin/pt-summary $RPM_BUILD_ROOT/usr/bin/pt-summary
-install -m 0755 %{_GOPATH}/bin/pt-mysql-summary $RPM_BUILD_ROOT/usr/bin/st-mysql-summary
-install -m 0755 %{_GOPATH}/bin/pt-mysql-summary $RPM_BUILD_ROOT/usr/bin/pt-mysql-summary
-install -m 0755 %{_GOPATH}/bin/pt-mongodb-summary $RPM_BUILD_ROOT/usr/bin/st-mongodb-summary
-install -m 0755 %{_GOPATH}/bin/pt-mongodb-summary $RPM_BUILD_ROOT/usr/bin/pt-mongodb-summary
-install -m 0755 %{_GOPATH}/bin/pt-visual-explain $RPM_BUILD_ROOT/usr/bin/st-visual-explain
-install -m 0755 %{_GOPATH}/bin/pt-visual-explain $RPM_BUILD_ROOT/usr/bin/pt-visual-explain
-install -m 0755 %{_GOPATH}/bin/pt-archiver $RPM_BUILD_ROOT/usr/bin/st-archiver
-install -m 0755 %{_GOPATH}/bin/pt-archiver $RPM_BUILD_ROOT/usr/bin/pt-archiver
+for file in %{_GOPATH}/bin/*
+do
+    cp $file $RPM_BUILD_ROOT/usr/bin/
+    st_basename=$(basename $file)
+    if [ " st-sideload-relay st-int-capacity-checker st-unused-key-checker st-oversized-blobs " == *" $st_basename "* ]; then
+        continue
+    fi
+    cp $file $RPM_BUILD_ROOT/usr/bin/pt${st_basename#st}
+done
 
 %clean
 rm -rf $RPM_BUILD_ROOT
 
-%postun
-# uninstall
-if [ "$1" = "0" ]; then
-    rm -f /usr/bin/{st,pt}-summary
-    rm -f /usr/bin/{st,pt}-mysql-summary
-    rm -f /usr/bin/{st,pt}-mongodb-summary
-    rm -f /usr/bin/{st,pt}-visual-explain
-    rm -f /usr/bin/{st,pt}-archiver
-    echo "Uninstall complete."
-fi
-
 %files
-/usr/bin/{st,pt}-summary
-/usr/bin/{st,pt}-mysql-summary
-/usr/bin/{st,pt}-mongodb-summary
-/usr/bin/{st,pt}-visual-explain
-/usr/bin/{st,pt}-archiver
+/usr/bin/st-*
+
+
+%package compat
+Summary:        Shattered Silicon Toolkit (compat)
+
+%description compat
+Shattered Silicon Toolkit (compat)
+
+%files compat
+/usr/bin/{st,pt}-*

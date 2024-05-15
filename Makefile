@@ -10,7 +10,7 @@ endif
 
 TARBALL_FILE	:= $(BUILDDIR)/tarballs/silicon-toolkit-$(VERSION)-$(RELEASE).tar.gz
 SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE).src.rpm
-RPM_FILE		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm
+RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm $(BUILDDIR)/results/RPMS/silicon-toolkit-compat-$(VERSION)-$(RELEASE).$(ARCH).rpm
 
 .PHONY: all
 all: srpm rpm
@@ -38,12 +38,16 @@ $(SRPM_FILE): $(TARBALL_FILE)
 	mv $(BUILDDIR)/rpmbuild/SRPMS/$(shell basename $(SRPM_FILE)) $(SRPM_FILE)
 
 .PHONY: rpm
-rpm: $(RPM_FILE)
+rpm: $(RPM_FILES)
 
-$(RPM_FILE): $(SRPM_FILE)
-	mkdir -vp $(BUILDDIR)/mock $(shell dirname $(RPM_FILE))
+$(RPM_FILES): $(SRPM_FILE)
+	mkdir -vp $(BUILDDIR)/mock
 	mock -r ssm-9-$(ARCH) --resultdir $(BUILDDIR)/mock --rebuild $(SRPM_FILE)
-	mv $(BUILDDIR)/mock/$(shell basename $(RPM_FILE)) $(RPM_FILE)
+
+	for rpm_file in $(RPM_FILES); do \
+		mkdir -vp $$(dirname $${rpm_file}); \
+		mv $(BUILDDIR)/mock/$$(basename $${rpm_file}) $${rpm_file}; \
+	done
 
 .PHONY: clean
 clean:
