@@ -418,7 +418,7 @@ sub main {
         my @max_values = ();
         eval { @max_values = @{$dbh->selectrow_arrayref("SELECT " . join(", ", map { "MAX(LENGTH(`" . $_->[0] . "`))" } @columns) . " FROM `${sm}`.`${table}`")} };
         if ($EVAL_ERROR) {
-          print "Can't get maximum lenght of columns " . join(",", map {$_->[0]} @columns) . " for table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
+          print "Can't get maximum length of columns " . join(",", map {$_->[0]} @columns) . " for table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
           return;
         }
 
@@ -501,7 +501,7 @@ Default credentials are read from the following files in the given order:
 
 =head1 DESCRIPTION
 
-st-oversized-blobs walks throught all tables in all schemas (or a specify schema
+st-oversized-blobs walks through all tables in all schemas (or a specify schema
 if --schema option is used), check if maximum length of a blob column has exceeded
 value of @@max_allowed_packet
 

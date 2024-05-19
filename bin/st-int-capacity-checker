@@ -512,7 +512,7 @@ Default credentials are read from the following files in the given order:
 
 =head1 DESCRIPTION
 
-st-int-capacity-checker walks throught all tables in all schemas (or a specify schema
+st-int-capacity-checker walks through all tables in all schemas (or a specify schema
 if --schema option is used), check if maximum value of a int column has exceeded the
 threshold (defaults to 80) of the column's maximum (2147483648 for signed,
 4294967295 for unsigned)

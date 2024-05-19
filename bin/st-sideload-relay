@@ -807,9 +807,9 @@ sub main {
 
       $relay_log_space_size += $fetched_binlog_size;
 
-      my $trimed_binlog_size;
+      my $trimmed_binlog_size;
       if ($pos eq 0) {
-        $trimed_binlog_size = $fetched_binlog_size;
+        $trimmed_binlog_size = $fetched_binlog_size;
       } else {
         my $fetched_binlog_fh;
         eval { open($fetched_binlog_fh, '<:raw', "${fetched_binlog}") or die "$!" };
@@ -839,12 +839,12 @@ sub main {
 
         STDEBUG && print "parsed length of first info log event: ${info_event_len}\n";
 
-        $trimed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and length of first info event 
+        $trimmed_binlog_size = $fetched_binlog_size - 4 - $info_event_len; # 4 magic bytes and length of first info event 
       }
-      $master_pos_offset += $trimed_binlog_size;
+      $master_pos_offset += $trimmed_binlog_size;
       push(@fetched_binlog_files, $fetched_binlog);
       $latest_master_log_file = $master_log_file;
-      $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimed_binlog_size : $trimed_binlog_size;
+      $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimmed_binlog_size : $trimmed_binlog_size;
 
       if ( !$initial_run || !defined $initial_prefetch || $initial_prefetch == 0 || $master_pos_offset > $initial_prefetch ) {
         STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
