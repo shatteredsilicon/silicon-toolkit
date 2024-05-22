@@ -15,14 +15,12 @@ endif
 
 TARBALL_FILE	:= $(BUILDDIR)/tarballs/silicon-toolkit-$(VERSION)-$(RELEASE).tar.gz
 SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE).src.rpm
-RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm $(BUILDDIR)/results/RPMS/silicon-toolkit-compat-$(VERSION)-$(RELEASE).$(ARCH).rpm
+RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm
 SDEB_FILES		:= $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).dsc $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).tar.gz
-DEB_FILES		:= $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).deb $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).changes $(BUILDDIR)/results/DEBS/silicon-toolkit-compat_$(VERSION)-$(RELEASE)_$(ARCH).deb
+DEB_FILES		:= $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).deb $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).changes
 
 $(TARBALL_FILE):
 	mkdir -vp $(shell dirname $(TARBALL_FILE))
-
-	GO111MODULE=on go mod vendor
 
 	tar --exclude-vcs -czf $(TARBALL_FILE) -C $(shell dirname $(CURDIR)) --transform s/^$(shell basename $(CURDIR))/silicon-toolkit/ $(shell basename $(CURDIR))
 
