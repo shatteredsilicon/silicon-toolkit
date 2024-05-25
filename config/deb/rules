@@ -4,7 +4,7 @@
 export DH_VERBOSE=1
 
 %:
-	dh $@
+	dh $@ --with systemd
 
 SHELL=/bin/bash
 TMP=$(CURDIR)/debian/tmp
@@ -16,3 +16,4 @@ override_dh_auto_install:
 	@echo "RULES.$@"
 	install -d $(TMP)
 	cp silicon-toolkit/bin/* $(TMP)/
+	cp silicon-toolkit/config/systemd/*.service $(TMP)/

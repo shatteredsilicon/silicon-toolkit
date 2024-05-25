@@ -11,6 +11,10 @@ Source0:        %{name}-%{version}-%{release}.tar.gz
 
 Requires: perl-DBI, perl-DBD-MySQL, MariaDB-shared
 
+Requires(post):     systemd
+Requires(preun):    systemd
+Requires(postun):   systemd
+
 %description
 Silicon Toolkit is a collection of advanced command-line tools used by
 Shattered Silicon (https://shatteredsilicon.net/) support staff to perform
@@ -29,20 +33,24 @@ visit https://github.com/shatteredsilicon.
 %prep
 %setup -q -n %{name}
 
-%build
-mkdir -p %{_GOPATH}/bin
-export GOPATH=%{_GOPATH}
-
-%{__cp} bin/* %{_GOPATH}/bin
-
-strip %{_GOPATH}/bin/* || true
-
 %install
 install -m 0755 -d $RPM_BUILD_ROOT/usr/bin
-cp bin/* $RPM_BUILD_ROOT/usr/bin/
+install -m 0755 -d $RPM_BUILD_ROOT/lib/systemd/system
+install -m 0755 bin/* $RPM_BUILD_ROOT/usr/bin/
+install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
+
+%post
+%systemd_post st-sideload-relay.service
+
+%preun
+%systemd_preun st-sideload-relay.service
+
+%postun
+%systemd_postun st-sideload-relay.service
 
 %clean
 rm -rf $RPM_BUILD_ROOT
 
 %files
-/usr/bin/st-*
+/usr/bin/*
+%config /lib/systemd/system/*

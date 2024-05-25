@@ -1,0 +1,12 @@
+[Unit]
+Description=Silicon Tookit Relay Log Sideloader
+After=mysql.service
+
+[Service]
+User=root
+ExecStart=/usr/bin/st-sideload-relay
+Type=simple
+PIDFile=/run/st-sideload-relay.pid
+
+[Install]
+WantedBy=multi-user.target
