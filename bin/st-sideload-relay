@@ -847,7 +847,7 @@ sub main {
       $latest_master_log_pos = $i eq 0 ? $master_log_pos + $trimmed_binlog_size : $trimmed_binlog_size;
 
       if ( !$initial_run || !defined $initial_prefetch || $initial_prefetch == 0 || $master_pos_offset > $initial_prefetch ) {
-        STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: $initial_prefetch\n";
+        STDEBUG && print "exiting fetching binlog because it's not an initial run or it reaches size of initial prefetch, initial_run: $initial_run, master_pos_offset: $master_pos_offset, initial_prefetch: " . ($initial_prefetch || '0') . "\n";
         last;
       }
     }
@@ -891,6 +891,12 @@ sub main {
     foreach my $i ( 0 .. $#fetched_binlog_files ) {
       my $fetched_binlog = $fetched_binlog_files[$i];
       my $relay_log = catfile(dirname($relay_log_basename), basename($relay_log_index_lines[-2-$#fetched_binlog_files+$i]));
+      chomp $relay_log;
+      my ($relay_log_uid, $relay_log_gid) = (stat("$relay_log"))[4,5];
+
+      STDEBUG && print "chowning ${fetched_binlog} with '$relay_log_uid:$relay_log_gid'\n";
+      chown $relay_log_uid, $relay_log_gid, "$fetched_binlog";
+
       STDEBUG && print "overwriting ${relay_log} with ${fetched_binlog}\n";
       my ($overwrite_relay_output, $overwrite_relay_stderr, $overwrite_relay_exit) = capture {
         system("mv ${fetched_binlog} ${relay_log}");
