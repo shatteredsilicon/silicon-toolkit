@@ -536,33 +536,16 @@ sub main {
 
   # get initial slave status
   my $init_slave_status;
-  while (1) {
-    eval { $init_slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
-    if ($EVAL_ERROR) {
-      $db->disconnect() if $db;
-      die "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
-    }
-
-    if (defined $init_slave_status->{Seconds_Behind_Master} && $init_slave_status->{Seconds_Behind_Master} < $min_lag) {
-      $verbose && warn "sleeping 10s because Seconds_Behind_Master = $init_slave_status->{Seconds_Behind_Master} is lower than min-lag = $min_lag\n";
-      sleep 10;
-      next;
-    }
-
-    last;
+  eval { $init_slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Failed to get init slave status info for channel '${channel_name}': ${EVAL_ERROR}";
   }
 
   $SIG{INT} = sub { my ($signal) = @_; terminate_handler($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg); };
   $SIG{TERM} = sub { my ($signal) = @_; terminate_handler($signal, $db, $channel_name, $init_slave_status, $mariadb_channel_arg, $mysql_channel_arg); };
 
   STDEBUG && print Dumper($init_slave_status);
-
-  # stop io_thread
-  eval { $db->{dbh}->do("STOP SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
-  if ($EVAL_ERROR) {
-    $db->disconnect() if $db;
-    die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
-  }
 
   my $initial_run = 1;
 
@@ -578,11 +561,23 @@ sub main {
       next EVENT;
     }
 
+    if (defined $slave_status->{Seconds_Behind_Master} && $slave_status->{Seconds_Behind_Master} < $min_lag) {
+      $verbose && warn "sleeping 1s because Seconds_Behind_Master = $slave_status->{Seconds_Behind_Master} is lower than min-lag = $min_lag\n";
+      next EVENT;
+    }
+
     # if there is an IO/SQL error, we don't want to continue
     # in this situation
     if ($slave_status->{Last_SQL_Error} || $slave_status->{Last_IO_Error}) {
       warn "Exiting because there is an IO/SQL error, Last_SQL_Error: $slave_status->{Last_SQL_Error}, Last_IO_Error: $slave_status->{Last_IO_Error}";
       last EVENT;
+    }
+
+    # stop io_thread
+    eval { $db->{dbh}->do("STOP SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
     }
 
     STDEBUG && print "fetching master log list with mysql cli args: -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B\n";
@@ -641,7 +636,7 @@ sub main {
       }
 
       if ($log_pos eq $master_log_pos && $i eq $#master_logs_output) {
-        last EVENT;
+        last;
       }
 
       my @rest_lines = ();
@@ -663,7 +658,9 @@ sub main {
     }
 
     if ((scalar @master_log_files) eq 0) {
-      last EVENT;
+      # means it caught up the master
+      ensure_slave_io_thread($db, $init_slave_status, $channel_name, $mariadb_channel_arg, $mysql_channel_arg);
+      next EVENT;
     }
 
     if ($io_thread_threshold > 0 && $exec_read_pos_offset > $io_thread_threshold) {
@@ -932,13 +929,7 @@ sub main {
     }
   }
 
-  # start io_thread if it was running
-  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
-    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
-    if ($EVAL_ERROR) {
-      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
-    }
-  }
+  ensure_slave_io_thread($db, $init_slave_status, $channel_name, $mariadb_channel_arg, $mysql_channel_arg);
 
   $db->disconnect() if $db;
   return 0;
@@ -949,13 +940,7 @@ sub terminate_handler {
 
   STDEBUG && print "got a signal '$signal' that's handled by terminate_handler\n";
 
-  # start io_thread if it was running
-  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
-    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
-    if ($EVAL_ERROR) {
-      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
-    }
-  }
+  ensure_slave_io_thread($db, $init_slave_status, $channel_name, $mariadb_channel_arg, $mysql_channel_arg);
 
   # start sql_thread if it was running
   if ($db->is_true($init_slave_status->{Slave_SQL_Running})) {
@@ -966,6 +951,18 @@ sub terminate_handler {
   }
 
   die "Caught a signal $signal";
+}
+
+sub ensure_slave_io_thread {
+  my ($db, $init_slave_status, $channel_name, $mariadb_channel_arg, $mysql_channel_arg) = @_;
+
+  # start io_thread if it was running
+  if ($db->is_true($init_slave_status->{Slave_IO_Running})) {
+    eval { $db->{dbh}->do("START SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Can't start io_thread for channel '$channel_name': ${EVAL_ERROR}";
+    }
+  }
 }
 
 # ############################################################################
