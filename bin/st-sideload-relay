@@ -312,10 +312,10 @@ sub get_dbi_dsn {
   my $socket_opt;
   eval{ require DBD::MariaDB };
   if ($@) {
-    $dsn = "DBI:mysql:";
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
     $socket_opt = 'socket';
   } else {
-    $dsn = "DBI:MariaDB:";
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
     $socket_opt = 'mariadb_socket';
   };
 
@@ -561,7 +561,7 @@ sub main {
       next EVENT;
     }
 
-    if (defined $slave_status->{Seconds_Behind_Master} && $slave_status->{Seconds_Behind_Master} < $min_lag) {
+    if ($db->is_true($init_slave_status->{Slave_IO_Running}) && defined $slave_status->{Seconds_Behind_Master} && $slave_status->{Seconds_Behind_Master} < $min_lag) {
       $verbose && warn "sleeping 1s because Seconds_Behind_Master = $slave_status->{Seconds_Behind_Master} is lower than min-lag = $min_lag\n";
       next EVENT;
     }
