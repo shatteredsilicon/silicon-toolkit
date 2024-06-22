@@ -580,6 +580,14 @@ sub main {
       die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
     }
 
+    # get latest slave status after stoping the io_thread
+    sleep 1;
+    eval { $slave_status = $db->{dbh}->selectrow_hashref("SHOW SLAVE ${mariadb_channel_arg} STATUS ${mysql_channel_arg}") };
+    if ($EVAL_ERROR) {
+      warn "Failed to get slave status info for channel '${channel_name}': ${EVAL_ERROR}";
+      next EVENT;
+    }
+
     STDEBUG && print "fetching master log list with mysql cli args: -h $master_info->{Host} -u $master_info->{User_name} --password=$master_info->{User_password} ${mysql_extra_args} -N -B\n";
 
     # get master binlog list
