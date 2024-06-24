@@ -561,7 +561,7 @@ sub main {
       next EVENT;
     }
 
-    if ($db->is_true($init_slave_status->{Slave_IO_Running}) && defined $slave_status->{Seconds_Behind_Master} && $slave_status->{Seconds_Behind_Master} < $min_lag) {
+    if ($db->is_true($slave_status->{Slave_IO_Running}) && defined $slave_status->{Seconds_Behind_Master} && $slave_status->{Seconds_Behind_Master} < $min_lag) {
       $verbose && warn "sleeping 1s because Seconds_Behind_Master = $slave_status->{Seconds_Behind_Master} is lower than min-lag = $min_lag\n";
       next EVENT;
     }
