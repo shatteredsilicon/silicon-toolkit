@@ -1,0 +1,1091 @@
+#!/usr/bin/env perl
+
+# This is st-innodb-size, a program to check row length of
+# a MySQL InnoDB table.
+#
+# Copyright (C) 2024  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class, $opt_str ) = @_;
+
+  my %options = (
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "database|D=s" => \my $database,
+    "charset|A=s" => \my $charset,
+    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
+    "ask-pass" => \my $ask_pass,
+    "verbose" => \my $verbose,
+    "databases|d=s@" => \my $databases,
+    "ignore-databases=s@" => \my $ignore_databases,
+    "tables|t=s@" => \my $tables,
+    "ignore-tables=s@" => \my $ignore_tables
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+
+  my %args = ();
+  foreach my $arg_key ( keys %options ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+    $args{$primary_name} = ${$options{$arg_key}};
+  }
+  my $self = {
+    args => \%args
+  };
+
+  if (defined $opt_str) {
+    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        STDEBUG && print "key: $opt_key, val: $opt_val\n";
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              $self->{args}->{$primary_name} = $opt_val;
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file", -php_compat => 1 )) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 1,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if (defined $socket && $socket ne '') {
+    $dsn = "${dsn};${socket_opt}=${socket}";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host}";
+  }
+
+  if (defined $database && $database ne '') {
+    $dsn = "${dsn};database=${database}";
+  }
+
+  if (defined $charset && $charset ne '') {
+    $dsn = "${dsn};charset=${charset}";
+  }
+
+  if (defined $mysql_read_default_file && $mysql_read_default_file ne '') {
+    $dsn = "${dsn};mysql_read_default_file=${mysql_read_default_file}";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_innodb_size program.
+# ############################################################################
+package st_innodb_size;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Capture::Tiny ':all';
+use Text::Table;
+use List::Util qw(sum);
+use Term::ANSIColor qw(colored);
+use POSIX qw(ceil);
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my $max_width = 74;
+my $hdr_width = $max_width - 2;  # for '# '
+my $hdr_fmt   = "# %-${hdr_width}s\n";
+
+my %fixed_length_data_types = (
+  "TINYINT"     => 1,
+  "SMALLINT"    => 2,
+  "MEDIUMINT"   => 3,
+  "INT"         => 4,
+  "INTEGER"     => 4,
+  "BIGINT"      => 8,
+  "FLOAT"       => 4,
+  "DOUBLE"      => 8,
+  "DECIMAL"     => 'int(($M-$D)/9)*4+int(((($M-$D)%9)+1)/2)+int($D/9)*4+int((($D%9)+1)/2)',
+  "NUMERIC"     => 'int(($M-$D)/9)*4+int(((($M-$D)%9)+1)/2)+int($D/9)*4+int((($D%9)+1)/2)',
+  "BIT"         => '($M+7)>>3',
+  "YEAR"        => 1,
+  "DATE"        => 3,
+  "TIME"        => '3+int(($M+1)/2)',
+  "DATETIME"    => '8+int(($M+1)/2)',
+  "TIMESTAMP"   => '4+int(($M+1)/2)',
+  "SET"         => '($M+7)>>3',
+  "ENUM"        => '$M>255?2:1',
+  "BINARY"      => '$M',
+  "CHAR"        => '$M',
+  "INET4"       => '$M',
+  "INET6"       => '$M',
+  "UUID"        => '$M'
+);
+
+my %string_data_types = (
+  '^.*(BLOB|TEXT)$' => 40,
+  '^.*(CHAR|BINARY)$' => 255,
+  '^INET4$' => undef,
+  '^INET6$' => undef,
+  '^UUID$' => undef,
+);
+
+my @table_titles = (\'| ', 'Column Name', \' | ', 'Type', \' | ', 'Min Size', \' | ', 'Max Size', \' |');
+
+# variables from innodb
+my $FIL_PAGE_DATA = 38;
+my $FSEG_PAGE_DATA = $FIL_PAGE_DATA;
+my $PAGE_HEADER = $FSEG_PAGE_DATA;
+my $FSEG_HEADER_SIZE = 10;
+my $PAGE_DATA = $PAGE_HEADER + 36 + 2 * $FSEG_HEADER_SIZE;
+my $REC_N_NEW_EXTRA_BYTES = 5;
+my $PAGE_NEW_SUPREMUM = $PAGE_DATA + 2 * $REC_N_NEW_EXTRA_BYTES + 8;
+my $PAGE_NEW_SUPREMUM_END = $PAGE_NEW_SUPREMUM + 8;
+my $FIL_PAGE_DATA_END = 8;
+my $PAGE_DIR = $FIL_PAGE_DATA_END;
+my $PAGE_DIR_SLOT_SIZE = 2;
+my $REC_N_OLD_EXTRA_BYTES = 6;
+my $PAGE_OLD_SUPREMUM = $PAGE_DATA + 2 + 2 * $REC_N_OLD_EXTRA_BYTES + 8;
+my $PAGE_OLD_SUPREMUM_END = $PAGE_OLD_SUPREMUM + 9;
+my $FIELD_REF_SIZE = 20;
+my $BTR_EXTERN_FIELD_REF_SIZE = $FIELD_REF_SIZE;
+my $REC_ANTELOPE_MAX_INDEX_COL_LEN = 768;
+my $DICT_ANTELOPE_MAX_INDEX_COL_LEN = $REC_ANTELOPE_MAX_INDEX_COL_LEN;
+my $UNIV_PAGE_SIZE_MAX = 1 << 16;
+my $REDUNDANT_REC_MAX_DATA_SIZE = 16383;
+my $PAGE_ZIP_DIR_SLOT_SIZE = 2;
+my $DATA_TRX_ID_LEN = 6;
+my $DATA_ROLL_PTR_LEN = 7;
+my $PAGE_ZIP_CLUST_LEAF_SLOT_SIZE = $PAGE_ZIP_DIR_SLOT_SIZE	+ $DATA_TRX_ID_LEN + $DATA_ROLL_PTR_LEN;
+
+sub main {
+  my @ARGV = @_;
+
+  my $o = new Option(shift @ARGV);
+  $o->parse_dsn();
+
+  my $database = $o->get_option('database');
+  my $password = $o->get_option('password');
+  if ($o->get_option('ask-pass')) {
+    eval {
+      require Term::ReadKey;
+      Term::ReadKey::ReadMode('noecho');
+      chomp($password = <STDIN>);
+      Term::ReadKey::ReadMode('normal');
+      print "\n"
+        or die "Cannot print: $OS_ERROR";
+    };
+    if ( $EVAL_ERROR ) {
+        die "Cannot read response; is Term::ReadKey installed? $EVAL_ERROR";
+    }
+  }
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $password,
+    database => $database,
+    charset => $o->get_option('charset'),
+    mysql_read_default_file => $o->get_option('mysql-read-default-file')
+  );
+
+  my $verbose = $o->get_option('verbose');
+  my $databases = $o->get_option('databases');
+  my $tables = $o->get_option('tables');
+  my $ignore_databases = $o->get_option('ignore-databases');
+  my $ignore_tables = $o->get_option('ignore-tables');
+
+  my $sql = "
+    SELECT  TABLE_SCHEMA AS table_schema,
+            TABLE_NAME AS table_name,
+            TABLE_COLLATION AS table_collation,
+            UPPER(row_format) AS row_format,
+            CREATE_OPTIONS AS create_options
+    FROM    information_schema.tables
+  ";
+
+  if (defined $database && $database ne '') {
+    push(@{$databases}, $database);
+  }
+
+  my @or_where_clauses = ();
+  if (defined $databases && (scalar @{$databases}) > 0) {
+    my $in_str = 'IN (' . join(', ', map { $db->{dbh}->quote("$_") } @{$databases}) . ')';
+    push(@or_where_clauses,  "table_schema $in_str");
+
+    my $schemas;
+    eval {
+      $schemas = $db->{dbh}->selectcol_arrayref("
+        SELECT  SCHEMA_NAME AS schema_name
+        FROM    information_schema.schemata
+        WHERE   schema_name $in_str
+      ")
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get schema list with @{$databases}: ${EVAL_ERROR}";
+    }
+
+    foreach my $tmp_database (@{$databases}) {
+      my $exists = 0;
+      foreach my $tmp_schema (@{$schemas}) {
+        if ("$tmp_database" eq "$tmp_schema") {
+          $exists = 1;
+          last;
+        }
+      }
+      if (!$exists) {
+        die "Database '$tmp_database' doesn't exist";
+      }
+    }
+  }
+
+  if (defined $tables && (scalar @{$tables}) > 0) {
+    my @mapped_strs = ();
+    foreach my $table (@{$tables}) {
+      my ($schema_or_tbl, $tbl) = split('\.', "$table", 2);
+      if ( defined $tbl && $tbl eq '' ) { die "table name in '$table' is not given" };
+
+      my $table_exists;
+      my $tmp_sql;
+      if (defined $tbl && defined $schema_or_tbl && $schema_or_tbl ne '') {
+        $tmp_sql = '( table_schema = ' . $db->{dbh}->quote("$schema_or_tbl") . ' AND table_name = ' . $db->{dbh}->quote("$tbl") . ' )';
+      } else {
+        $tmp_sql = 'table_name = ' . $db->{dbh}->quote("$schema_or_tbl");
+      }
+      eval {
+        $table_exists = $db->{dbh}->selectcol_arrayref("
+          SELECT  1
+          FROM    information_schema.tables
+          WHERE   ${tmp_sql} AND table_type = 'BASE TABLE' AND engine = 'InnoDB'
+          LIMIT   1
+        ")->[0]
+      };
+      if ($EVAL_ERROR) {
+        die "Can't check if table exists for '$table': $EVAL_ERROR";
+      }
+      if (!defined $table_exists || !$table_exists) {
+        die "BASE TABLE '$table' doesn't exists or it's not a InnoDB table";
+      }
+      push(@mapped_strs, "${tmp_sql}");
+    }
+    push(@or_where_clauses, '( ' . join(' OR ', @mapped_strs) . ' )');
+  }
+
+  my @and_where_clauses = ();
+  push(@{$ignore_databases}, ('information_schema', 'mysql', 'performance_schema'));
+  if ((scalar @{$ignore_databases}) > 0) {
+    push(@and_where_clauses, 'table_schema NOT IN (' . join(', ', map { $db->{dbh}->quote("$_") } @{$ignore_databases}) . ')' );
+  }
+
+  if (defined $ignore_tables && (scalar @{$ignore_tables}) > 0) {
+    push(@and_where_clauses, '( ' . join(' AND ', map {
+      my ($schema_or_tbl, $tbl) = split('\.', "$_", 2);
+      if ( defined $tbl && $tbl eq '' ) { die "table name in '$_' is not given" };
+      defined $tbl && defined $schema_or_tbl && $schema_or_tbl ne ''
+        ? '!( table_schema = ' . $db->{dbh}->quote("$schema_or_tbl") . ' AND table_name = ' . $db->{dbh}->quote("$tbl") . ' )'
+        : 'table_name != ' . $db->{dbh}->quote("$schema_or_tbl")
+    } @{$ignore_tables}) . ' )');
+  }
+
+  $sql = "$sql
+    WHERE table_type = 'BASE TABLE' AND engine = 'InnoDB' AND (" . ((scalar @or_where_clauses) > 0 ? join(' OR ', @or_where_clauses) : "1") . ") AND (" . join(' AND ', @and_where_clauses) . ")
+  ";
+
+  STDEBUG && print "structured sql -> $sql\n";
+
+  my $table_rows;
+  eval { $table_rows = $db->{dbh}->selectall_arrayref("$sql", { Slice => {} }) };
+  if ($EVAL_ERROR) {
+    die "Can't get table rows: ${EVAL_ERROR}";
+  }
+
+  my $default_row_format;
+  eval { $default_row_format = $db->{dbh}->selectrow_arrayref('SELECT UPPER(@@innodb_default_row_format)')->[0] };
+  if ($EVAL_ERROR) {
+    die "Can't get default innodb row format: ${EVAL_ERROR}";
+  }
+
+  my $innodb_page_size;
+  eval { $innodb_page_size = $db->{dbh}->selectrow_arrayref('SELECT @@innodb_page_size')->[0] };
+  if ( $EVAL_ERROR ) {
+      die "Can't get innodb page size: $EVAL_ERROR";
+  }
+
+  foreach my $table_row (@{$table_rows}) {
+    my ($D, $M, $S, $dt, $dp, $bc, $C, $L, $CL);
+    my $schema = $table_row->{table_schema};
+    my $table = $table_row->{table_name};
+    my $fieldCount = 0;
+    my $byteCount = 0;
+    my $byteCountMin = 0;
+    my @fields = ();
+    my $fieldName;
+    my $tableName;
+    my $defaultDbCL = 1;
+    my $defaultTableCL = 1;
+
+    my $column_rows;
+    eval {
+      $column_rows = $db->{dbh}->selectall_arrayref("
+        SELECT  UPPER(data_type) AS data_type,
+                CHARACTER_MAXIMUM_LENGTH AS character_maximum_length,
+                CHARACTER_OCTET_LENGTH AS character_octet_length,
+                NUMERIC_PRECISION AS numeric_precision,
+                NUMERIC_SCALE AS numeric_scale,
+                DATETIME_PRECISION AS datetime_precision,
+                COLUMN_NAME AS column_name,
+                COLUMN_KEY AS column_key,
+                COLUMN_TYPE AS column_type,
+                IS_NULLABLE AS is_nullable
+        FROM    information_schema.columns
+        WHERE   table_schema = " . $db->{dbh}->quote("$schema") . " AND
+                table_name = " . $db->{dbh}->quote("$table") . "
+      ", { Slice => {} })
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get column rows for schema='$schema', table='$table': ${EVAL_ERROR}";
+    }
+
+    my $has_primary_key;
+    eval {
+      $has_primary_key = defined $db->{dbh}->selectrow_arrayref("
+        SELECT  constraint_name
+        FROM    information_schema.table_constraints
+        WHERE   table_schema = " . $db->{dbh}->quote("$schema") . "
+          AND   table_name = " . $db->{dbh}->quote("$table") . "
+          AND   constraint_name = 'PRIMARY'
+      ") ? 1 : 0
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get primary key for schema='$schema', table='$table': ${EVAL_ERROR}";
+    }
+
+    my $tb;
+    my $row_sizes;
+    my $row_limit;
+
+    my $row_format = $table_row->{"row_format"} || $default_row_format;
+    if ( "$row_format" eq 'REDUNDANT') {
+      ( $tb, $row_sizes, $row_limit ) = redundant_size($db, $column_rows, $innodb_page_size, $has_primary_key, $verbose);
+    } elsif ( "$row_format" eq 'COMPACT' ) {
+      ( $tb, $row_sizes, $row_limit ) = compact_size($db, $column_rows, $innodb_page_size, $has_primary_key, $verbose);
+    } elsif ( "$row_format" eq 'DYNAMIC' ) {
+      ( $tb, $row_sizes, $row_limit ) = dynamic_size($db, $column_rows, $innodb_page_size, $has_primary_key, $verbose);
+    } elsif ( "$row_format" eq 'COMPRESSED' ) {
+      my $key_block_size;
+      foreach my $create_option (split /,/, "$table_row->{create_options}") {
+        chomp $create_option;
+        if ( ( $key_block_size ) = $create_option =~ m/^key_block_size=(\d+)$/i ) {
+          last;
+        }
+      }
+      ( $tb, $row_sizes, $row_limit ) = compressed_size($db, $column_rows, $innodb_page_size, $key_block_size, $has_primary_key, $verbose);
+    } else {
+      die "Unknown innodb row format '$row_format' for schema='$schema', table='$table'";
+    }
+
+    if (!$verbose && $row_sizes->[1] < $row_limit) {
+      next;
+    }
+
+    printf $hdr_fmt, ('#' x $hdr_width);
+    printf $hdr_fmt, "$schema.$table ($table_row->{'row_format'})";
+    printf $hdr_fmt, ('#' x $hdr_width);
+    print "\n";
+
+    print_table($tb);
+
+    print "\n";
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+sub set_column_size {
+  my ( $db, $column, $is_compact ) = @_;
+  my $M = $column->{data_type} eq "ENUM"
+            ? (($column->{column_type} =~ s/(\'.*?\'(?!\')(?=,|$))/$1/g) || 0) + 1
+            : (grep { "$column->{'data_type'}" =~ m/$_/ } (keys %string_data_types))
+                ? $column->{character_octet_length}
+                : ($column->{character_maximum_length} || $column->{numeric_precision} || $column->{datetime_precision} || 0);
+  my $D = $column->{numeric_scale} || 0;
+
+  my $max_value;
+  my $is_fixed_length = 0;
+  if (exists $fixed_length_data_types{$column->{data_type}}) {
+    $max_value = eval($fixed_length_data_types{$column->{data_type}});
+    $is_fixed_length = 1;
+  } else {
+    $max_value = $M;
+  }
+  if ($max_value > ($BTR_EXTERN_FIELD_REF_SIZE + $DICT_ANTELOPE_MAX_INDEX_COL_LEN)) {
+    $max_value = 768 + 20;
+    $is_fixed_length = 0;
+  }
+
+  my $min_value;
+  if ($db->is_true($column->{is_nullable})) {
+    if (!$is_compact && $is_fixed_length) {
+      $min_value = $max_value;
+    } else {
+      $min_value = 0;
+    }
+  } elsif ($is_fixed_length) {
+    if ($is_compact && defined $column->{character_octet_length}) {
+      # The compact family row formats attempts to store variable-length
+      # character sets in N bytes by trimming trailing spaces.
+      # TODO: check if it's in a variable-length character set.
+      $min_value = $column->{character_octet_length};
+    } else {
+      $min_value = $max_value;
+    }
+  } elsif (!$is_compact && defined $column->{character_maximum_length} && defined $column->{character_octet_length}) {
+    # For string-like data types and it's non-null, at least 1 character
+    $min_value = int($column->{character_maximum_length} / $column->{character_octet_length});
+  } else {
+    $min_value = 1;
+  }
+
+  my @sizes = ($min_value, $max_value);
+  $column->{sizes} = \@sizes;
+  $column->{is_fixed_length} = $is_fixed_length;
+}
+
+sub redundant_row_sizes {
+  my ( $db, $columns, $has_primary_key ) = @_;
+
+  my $common_columns_size =
+      6                                                      # a 6-byte transaction ID
+    + 7                                                      # a 7-byte row pointer
+    + (defined $has_primary_key && $has_primary_key ? 0 : 6) # a 6-byte row ID if no primary key is defined
+    ;
+
+  my $min_columns_size = (sum map { $_->{sizes}->[0] } @{$columns}) + $common_columns_size;
+  my $max_columns_size = (sum map { $_->{sizes}->[1] } @{$columns}) + $common_columns_size;
+  my $column_count = (scalar @{$columns}) + (defined $has_primary_key && $has_primary_key ? 2 : 3);
+  my $min_record_directory_size = $column_count * ( $min_columns_size < 128 ? 1 : 2 );
+  my $max_record_directory_size = $column_count *( $max_columns_size < 128 ? 1 : 2 );
+
+  my $min_row_size = $REC_N_OLD_EXTRA_BYTES + $min_record_directory_size + $min_columns_size;
+  my $max_row_size = $REC_N_OLD_EXTRA_BYTES + $max_record_directory_size + $max_columns_size;
+
+  my @row_sizes = ($min_row_size, $max_row_size);
+  return \@row_sizes;
+}
+
+sub compact_family_row_sizes {
+  my ( $db, $columns, $has_primary_key, $is_compressed ) = @_;
+
+  my $common_columns_size =
+      6                                                      # a 6-byte transaction ID
+    + 7                                                      # a 7-byte row pointer
+    + (defined $has_primary_key && $has_primary_key ? 0 : 6) # a 6-byte row ID if no primary key is defined
+    ;
+
+  my $min_columns_size = (sum map { $_->{sizes}->[0] } @{$columns}) + $common_columns_size;
+  my $max_columns_size = (sum map { $_->{sizes}->[1] } @{$columns}) + $common_columns_size;
+
+  my $nullable_column_count = scalar ( grep { $db->is_true($_->{is_nullable}) } @{$columns} );
+  my $nullable_bit_vector = ceil($nullable_column_count / 8);
+
+  my $min_variable_length_size = sum map {
+    ( $db->is_true($_->{is_nullable}) || $_->{is_fixed_length} )
+    ? 0
+    : (
+        $_->{sizes}->[0] < 128
+        ? 1
+        : 2
+      )
+    ;
+   } @{$columns};
+
+  my $max_variable_length_size = sum map { 
+    $_->{is_fixed_length}
+    ? 0
+    : (
+        $_->{sizes}->[1] < 256
+        ? 1
+        : 2
+      )
+    ;
+   } @{$columns};
+
+  my $min_row_size =
+      ( defined $is_compressed && $is_compressed ? 2 : $REC_N_NEW_EXTRA_BYTES )
+    + $nullable_bit_vector
+    + $min_variable_length_size
+    + $min_columns_size;
+
+  my $max_row_size =
+      ( defined $is_compressed && $is_compressed ? 2 : $REC_N_NEW_EXTRA_BYTES )
+    + $nullable_bit_vector
+    + $max_variable_length_size
+    + $max_columns_size;
+
+  my @row_sizes = ($min_row_size, $max_row_size);
+  return \@row_sizes;
+}
+
+sub redundant_row_limit {
+  my ( $db, $page_size ) = @_;
+
+  if ($page_size >= $UNIV_PAGE_SIZE_MAX) {
+    return $REDUNDANT_REC_MAX_DATA_SIZE;
+  }
+
+  return int(
+    ( $page_size
+    - $PAGE_OLD_SUPREMUM_END
+		- $PAGE_DIR
+		- 2 * $PAGE_DIR_SLOT_SIZE
+    ) / 2
+  );
+}
+
+sub compact_family_row_limit {
+  my ( $db, $page_size ) = @_;
+
+  return int(
+    ( $page_size
+    - $PAGE_NEW_SUPREMUM_END
+		- $PAGE_DIR
+		- 2 * $PAGE_DIR_SLOT_SIZE
+    ) / 2
+  );
+}
+
+sub compressed_row_limt {
+  my ( $db, $columns, $file_block_size, $has_primary_key ) = @_;
+
+  my $column_count = (scalar @{$columns}) + (defined $has_primary_key && $has_primary_key ? 2 : 3);
+  my $source_len = 2 * ($column_count + 1);
+  my $compress_bound = $source_len + ($source_len >> 12) + ($source_len >> 14) + ($source_len >> 25) + 13;
+
+  return
+      $file_block_size
+    - (
+          $PAGE_DATA
+        + $PAGE_ZIP_CLUST_LEAF_SLOT_SIZE
+        + 1
+        + 1
+        - $REC_N_NEW_EXTRA_BYTES
+      )
+		- $compress_bound
+    - 1
+    ;
+}
+
+sub fit_column_size {
+  my ( $db, $columns, $limit_size, $has_primary_key, $is_compressed ) = @_;
+
+  foreach my $column (@{$columns}) { set_column_size($db, $column, 1); }
+  my @sorted_columns = sort { ${b}->{column}->{sizes}[1] > ${a}->{column}->{sizes}[1] } ( map({ column => $_ }, @{$columns}) );
+  my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key, $is_compressed);
+  foreach my $sorted_column (@sorted_columns) {
+    if ( $row_sizes->[1] < $limit_size ) {
+      last;
+    }
+
+    if ($sorted_column->{column}->{sizes}->[1] < 256) {
+      next;
+    }
+
+    $sorted_column->{column}->{sizes}->[1] = 20;
+    if ($sorted_column->{column}->{sizes}->[0] > $sorted_column->{column}->{sizes}->[1]) {
+      $sorted_column->{column}->{sizes}->[0] = $sorted_column->{column}->{sizes}->[1];
+    }
+
+    $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key);
+  }
+}
+
+sub redundant_size {
+  my ( $db, $columns, $innodb_page_size, $has_primary_key ) = @_;
+
+  my $tb = Text::Table->new(@table_titles);
+  foreach my $column (@{$columns}) {
+    set_column_size($db, $column, 0);
+    $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
+  }
+  my $row_sizes = redundant_row_sizes($db, $columns, $has_primary_key);
+  my $row_limit = redundant_row_limit($db, $innodb_page_size);
+  $tb->add('ROW', '', $row_sizes->[0], $row_sizes->[1] >= $row_limit ? colored(['red'], $row_sizes->[1]) : colored(['green'], $row_sizes->[1]));
+  $tb->add('LIMIT', '', '', $row_limit);
+
+  return ($tb, $row_sizes, $row_limit);
+}
+
+sub compact_size {
+  my ( $db, $columns, $innodb_page_size, $has_primary_key ) = @_;
+
+  my $tb = Text::Table->new(@table_titles);
+  foreach my $column (@{$columns}) {
+    set_column_size($db, $column, 1);
+    $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
+  }
+  my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key);
+  my $row_limit = compact_family_row_limit($db, $innodb_page_size);
+  $tb->add('ROW', '', $row_sizes->[0], $row_sizes->[1] >= $row_limit ? colored(['red'], $row_sizes->[1]) : colored(['green'], $row_sizes->[1]));
+  $tb->add('LIMIT', '', '', $row_limit);
+
+  return ($tb, $row_sizes, $row_limit);
+}
+
+sub dynamic_size {
+  my ( $db, $columns, $innodb_page_size, $has_primary_key ) = @_;
+
+  my $row_limit = compact_family_row_limit($db, $innodb_page_size);
+  fit_column_size($db, $columns, $row_limit, $has_primary_key);
+
+  my $tb = Text::Table->new(@table_titles);
+  foreach my $column (@{$columns}) {
+    $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
+  }
+
+  my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key);
+  $tb->add('ROW', '', $row_sizes->[0], $row_sizes->[1] >= $row_limit ? colored(['red'], $row_sizes->[1]) : colored(['green'], $row_sizes->[1]));
+  $tb->add('LIMIT', '', '', $row_limit);
+
+  return ($tb, $row_sizes, $row_limit);
+}
+
+sub compressed_size {
+  my ( $db, $columns, $innodb_page_size, $key_block_size, $has_primary_key ) = @_;
+
+  my $file_block_size;
+  if (!defined $file_block_size || !$file_block_size) {
+    $file_block_size = $innodb_page_size / 2;
+  } else {
+    $file_block_size = $key_block_size * 1024;
+  }
+
+  my $row_limit = compressed_row_limt($db, $columns, $file_block_size, $has_primary_key);
+  fit_column_size($db, $columns, $row_limit, $has_primary_key, 1);
+
+  my $tb = Text::Table->new(@table_titles);
+  foreach my $column (@{$columns}) {
+    $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
+  }
+
+  my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key, 1);
+  $tb->add('ROW', '', $row_sizes->[0], $row_sizes->[1] >= $row_limit ? colored(['red'], $row_sizes->[1]) : colored(['green'], $row_sizes->[1]));
+  $tb->add('LIMIT', '', '', $row_limit);
+
+  return ($tb, $row_sizes, $row_limit);
+}
+
+sub print_table {
+  my ( $tb ) = @_;
+
+  my $rule = $tb->rule(qw/- +/);
+  my @lines = $tb->body;
+
+  print $rule . $tb->title . $rule;
+  for (@lines) {
+    print $_ . $rule;
+  }
+
+  print "\n";
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-innodb-size - a program to check row length of a MySQL InnoDB table.
+
+=head1 SYNOPSIS
+
+Usage: st-innodb-size [OPTION...] [DSN]
+
+st-innodb-size checks row length of a MySQL InnoDB table.
+
+Example:
+
+  st-innodb-size
+
+  st-innodb-size -u mysql -h localhost
+
+  st-innodb-size u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-innodb-size checks all columns of a MySQL InnoDB table, calculates the
+row length of it.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--schema>
+
+type: string
+
+The schema to be checked
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--ask-pass>
+
+type: boolean
+
+Prompt for a password when connecting to MySQL.
+
+=item B<--tables>
+
+short form: -t; type: list
+
+Check only this list of tables.
+
+Table names may be qualified with the database name.
+
+=item B<--databases>
+
+short form: -d; type: list
+
+Check only this list of databases.
+
+=item B<--ignore-databases>
+
+type: list
+
+Ignore this list of databases.
+
+=item B<--ignore-tables>
+
+type: list
+
+Ignore this list of tables.
+
+Table names may be qualified with the database name.
+
+=item B<--verbose>
+
+type: boolean; default: false
+
+Whether to show all tables.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=back
+
+=head1 DSN OPTIONS
+
+These DSN options are used to create a DSN.  Each option is given like
+C<option=value>.  The options are case-sensitive, so P and p are not the
+same option.  There cannot be whitespace before or after the C<=> and
+if the value contains whitespace it must be quoted.  DSN options are
+comma-separated.
+
+=over
+
+=item * A
+
+Default character set.
+
+=item * D
+
+Default database.
+
+=item * F
+
+Only read default options from the given file
+
+=item * h
+
+Connect to host.
+
+=item * p
+
+Password to use when connecting.
+If password contains commas they must be escaped with a backslash: "exam\,ple"
+
+=item * P
+
+Port number to use for connection.
+
+=item * S
+
+Socket file to use for connection.
+
+=item * u
+
+User for login if not current user.
+
+=cut
