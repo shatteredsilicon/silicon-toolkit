@@ -1,0 +1,648 @@
+#!/usr/bin/env perl
+
+# This is st-memory-calculator, a program to show the theoretical maximum
+# memory usage of MySQL.
+#
+# Copyright (C) 2024  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class, $opt_str ) = @_;
+
+  my %options = (
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "database|D=s" => \my $database,
+    "charset|A=s" => \my $charset,
+    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
+    "ask-pass" => \my $ask_pass,
+    "verbose" => \my $verbose
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+
+  my %args = ();
+  foreach my $arg_key ( keys %options ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+    $args{$primary_name} = ${$options{$arg_key}};
+  }
+  my $self = {
+    args => \%args
+  };
+
+  if (defined $opt_str) {
+    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        STDEBUG && print "key: $opt_key, val: $opt_val\n";
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              $self->{args}->{$primary_name} = $opt_val;
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file", -php_compat => 1 )) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Text::Table;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 1,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if (defined $socket && $socket ne '') {
+    $dsn = "${dsn};${socket_opt}=${socket}";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host}";
+  }
+
+  if (defined $database && $database ne '') {
+    $dsn = "${dsn};database=${database}";
+  }
+
+  if (defined $charset && $charset ne '') {
+    $dsn = "${dsn};charset=${charset}";
+  }
+
+  if (defined $mysql_read_default_file && $mysql_read_default_file ne '') {
+    $dsn = "${dsn};mysql_read_default_file=${mysql_read_default_file}";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_memory_calculator program.
+# ############################################################################
+package st_memory_calculator;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Capture::Tiny ':all';
+use Text::Table;
+use Number::Bytes::Human qw(format_bytes);
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my $max_width = 74;
+my $hdr_width = $max_width - 2;  # for '# '
+my $hdr_fmt   = "# %-${hdr_width}s\n";
+
+my @per_connection_table_header = (\'| ', 'Setting', \' | ', +{title=>'Value', align=>'right', align_title=>'right'}, \' | ', +{title=>'Total (x connections)', align=>'right', align_title=>'right'}, \' |');
+my @per_replication_thread_table_header = (\'| ', 'Setting', \' | ', +{title=>'Value', align=>'right', align_title=>'right'}, \' | ', +{title=>'Total (x replication thread)', align=>'right', align_title=>'right'}, \' |');
+my @global_table_header = (\'| ', 'Setting', \' | ', +{title=>'Value', align=>'right', align_title=>'right'}, \' |');
+my @total_table_header = (\'| ', 'Allocations', \' | ', +{title=>'Value', align=>'right', align_title=>'right'}, \' |');
+
+sub main {
+  my @ARGV = @_;
+
+  my $o = new Option(shift @ARGV);
+  $o->parse_dsn();
+
+  my $database = $o->get_option('database');
+  my $password = $o->get_option('password');
+  if ($o->get_option('ask-pass')) {
+    eval {
+      require Term::ReadKey;
+      Term::ReadKey::ReadMode('noecho');
+      chomp($password = <STDIN>);
+      Term::ReadKey::ReadMode('normal');
+      print "\n"
+        or die "Cannot print: $OS_ERROR";
+    };
+    if ( $EVAL_ERROR ) {
+        die "Cannot read response; is Term::ReadKey installed? $EVAL_ERROR";
+    }
+  }
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $password,
+    database => $database,
+    charset => $o->get_option('charset'),
+    mysql_read_default_file => $o->get_option('mysql-read-default-file')
+  );
+
+  my $verbose = $o->get_option('verbose');
+
+  my %per_connection_allocations = (
+    "binlog_cache_size" => 'SELECT @@binlog_file_cache_size, @@binlog_file_cache_size * @@max_connections',
+    "binlog_stmt_cache_size" => 'SELECT @@binlog_stmt_cache_size, @@binlog_stmt_cache_size * @@max_connections',
+    "bulk_insert_buffer_size" => 'SELECT @@bulk_insert_buffer_size, @@bulk_insert_buffer_size * @@max_connections',
+    "join_buffer_size" => 'SELECT @@join_buffer_size, @@join_buffer_size * @@max_connections',
+    "net_buffer_length" => 'SELECT @@net_buffer_length, @@net_buffer_length * @@max_connections',
+    "read_buffer_size" => 'SELECT @@read_buffer_size, @@read_buffer_size * @@max_connections',
+    "read_rnd_buffer_size" => 'SELECT @@read_rnd_buffer_size, @@read_rnd_buffer_size * @@max_connections',
+    "sort_buffer_size" => 'SELECT @@sort_buffer_size, @@sort_buffer_size * @@max_connections',
+    "thread_stack" => 'SELECT @@thread_stack, @@thread_stack * @@max_connections',
+  );
+  my %per_replication_thread_allocations = (
+    "slave_parallel_max_queued" => 'SELECT @@slave_parallel_max_queued, @@slave_parallel_max_queued * @@slave_parallel_threads'
+  );
+  my %global_allocations = (
+    "binlog_file_cache_size" => 'SELECT @@binlog_file_cache_size',
+    "innodb_buffer_pool_size" => 'SELECT @@innodb_buffer_pool_size',
+    "innodb_log_buffer_size" => 'SELECT @@innodb_log_buffer_size',
+    "key_buffer_size" => 'SELECT @@key_buffer_size',
+    "query_cache_size" => 'SELECT @@query_cache_size',
+    "open_files_limit" => 'SELECT @@open_files_limit * 1024'
+  );
+
+  my $per_connection_allocations_table = Text::Table->new(@per_connection_table_header);
+  my $per_replication_thread_allocations_table = Text::Table->new(@per_replication_thread_table_header);
+  my $global_allocations_table = Text::Table->new(@global_table_header);
+  my $per_connection_allocations_total = 0;
+  my $per_replication_thread_allocations_total = 0;
+  my $global_allocations_total = 0;
+
+  foreach my $key (keys %per_connection_allocations) {
+    my $values;
+    eval { $values = $db->{dbh}->selectrow_arrayref($per_connection_allocations{$key}) };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get value with '$per_connection_allocations{$key}' for global variable '${key}'";
+    }
+
+    $per_connection_allocations_table->add("$key", "$values->[0]", "$values->[1]");
+    $per_connection_allocations_total += $values->[1];
+  }
+
+  foreach my $key (keys %per_replication_thread_allocations) {
+    my $values;
+    eval { $values = $db->{dbh}->selectrow_arrayref($per_replication_thread_allocations{$key}) };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get value with '$per_replication_thread_allocations{$key}' for global variable '${key}'";
+    }
+
+    $per_replication_thread_allocations_table->add("$key", "$values->[0]", "$values->[1]");
+    $per_replication_thread_allocations_total += $values->[1];
+  }
+
+  foreach my $key (keys %global_allocations) {
+    my $values;
+    eval { $values = $db->{dbh}->selectrow_arrayref($global_allocations{$key}) };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get value with '$global_allocations{$key}' for global variable '${key}'";
+    }
+
+    $global_allocations_table->add("$key", "$values->[0]");
+    $global_allocations_total += $values->[0];
+  }
+
+  my $formatted_per_connection_allocations_total = format_bytes($per_connection_allocations_total);
+  my $formatted_per_replication_thread_allocations_total = format_bytes($per_replication_thread_allocations_total);
+  my $formatted_global_allocations_total = format_bytes($global_allocations_total);
+  my $formatted_total_total = format_bytes($per_connection_allocations_total+$per_replication_thread_allocations_total+$global_allocations_total);
+
+  my $total_table = Text::Table->new(@total_table_header);
+  $total_table->add("Per connection allocations", "$formatted_per_connection_allocations_total");
+  $total_table->add("Per replication thread allocations", "$formatted_per_replication_thread_allocations_total");
+  $total_table->add("Global allocations", "$formatted_global_allocations_total");
+  $total_table->add("Total", "$formatted_total_total");
+
+  $per_connection_allocations_table->add("Total", "", "$formatted_per_connection_allocations_total");
+  $per_replication_thread_allocations_table->add("Total", "", "$formatted_per_replication_thread_allocations_total");
+  $global_allocations_table->add("Total", "$formatted_global_allocations_total");
+
+  my $max_connections;
+  eval { $max_connections = $db->{dbh}->selectrow_arrayref('SELECT @@max_connections')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get value of global variable 'max_connections'";
+  }
+
+  my $slave_parallel_threads;
+  eval { $slave_parallel_threads = $db->{dbh}->selectrow_arrayref('SELECT @@slave_parallel_threads')->[0] };
+  if ($EVAL_ERROR) {
+    $db->disconnect() if $db;
+    die "Can't get value of global variable 'slave_parallel_threads'";
+  }
+
+  print "\n";
+  print "Per connection allocations (max_connections = ${max_connections}):\n";
+  print_table($per_connection_allocations_table);
+  print "Per replication thread allocations (slave_parallel_threads = ${slave_parallel_threads}):\n";
+  print_table($per_replication_thread_allocations_table);
+  print "Global allocations:\n";
+  print_table($global_allocations_table);
+  print "Total:\n";
+  print_table($total_table);
+
+  if ($verbose) {
+    my $max_allowed_packet;
+    eval { $max_allowed_packet = $db->{dbh}->selectrow_arrayref('SELECT @@max_allowed_packet')->[0] };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get value of global variable 'max_allowed_packet'";
+    }
+
+    my $tmp_table_size;
+    eval { $tmp_table_size = $db->{dbh}->selectrow_arrayref('SELECT @@tmp_table_size')->[0] };
+    if ($EVAL_ERROR) {
+      $db->disconnect() if $db;
+      die "Can't get value of global variable 'tmp_table_size'";
+    }
+
+    print "max_allowed_packet: ${max_allowed_packet}\nMaximum size in bytes of a packet or a generated/intermediate string. The packet message buffer is initialized with the value from net_buffer_length, but can grow up to max_allowed_packet bytes. Has to fit largest query (e.g. large INSERTs for loading mysqldump generated backups) and largest returned payload (while you can cursor through payload one row at a time, large text/blob retrievals still have to fit into max_allowed_packet).\nRelated: slave_max_allowed_packet for replication purposes (largest transaction has to fit into this size).\n\nWhile maximum theoretical usage for this allocation is max_allowed_packet x max_connections, this can be absurdly large and should not for part of memory estimate calculations unless your workload is unusual.\n";
+    print "\n";
+    print "tmp_table_size: ${tmp_table_size}\nThis allocation is per table, rather than global or per connection. Since there is no hard limit on how many implicit temporary tables a query could create (e.g., number of CTEs, sub-selects or VIEWs used in a query, though these will not resolve as temporary tables in all cases), maximum memory usage arising from tmp_table_size is incalculable.\n";
+    print "\n";
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+sub print_table {
+  my ( $tb ) = @_;
+
+  my $rule = $tb->rule(qw/- +/);
+  my @lines = $tb->body;
+
+  print $rule . $tb->title . $rule;
+  for my $i ( 0 .. (scalar(@lines)-2)) {
+    print $lines[$i];
+  }
+  print $rule . $lines[scalar(@lines)-1] . $rule;
+
+  print "\n";
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-memory-calculator - a program to show the theoretical maximum memory usage of MySQL.
+
+=head1 SYNOPSIS
+
+Usage: st-memory-calculator [OPTION...] [DSN]
+
+st-memory-calculator show the theoretical maximum memory usage of MySQL.
+
+Example:
+
+  st-memory-calculator
+
+  st-memory-calculator -u mysql -h localhost
+
+  st-memory-calculator u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-memory-calculator fetches related global variables from MySQL and calculates
+the theoretical maximum memory usage with them.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--schema>
+
+type: string
+
+The schema to be checked
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--ask-pass>
+
+type: boolean
+
+Prompt for a password when connecting to MySQL.
+
+=item B<--verbose>
+
+type: boolean; default: false
+
+Whether to show all tables.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=back
+
+=head1 DSN OPTIONS
+
+These DSN options are used to create a DSN.  Each option is given like
+C<option=value>.  The options are case-sensitive, so P and p are not the
+same option.  There cannot be whitespace before or after the C<=> and
+if the value contains whitespace it must be quoted.  DSN options are
+comma-separated.
+
+=over
+
+=item * A
+
+Default character set.
+
+=item * D
+
+Default database.
+
+=item * F
+
+Only read default options from the given file
+
+=item * h
+
+Connect to host.
+
+=item * p
+
+Password to use when connecting.
+If password contains commas they must be escaped with a backslash: "exam\,ple"
+
+=item * P
+
+Port number to use for connection.
+
+=item * S
+
+Socket file to use for connection.
+
+=item * u
+
+User for login if not current user.
+
+=cut
