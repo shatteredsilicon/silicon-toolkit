@@ -54,11 +54,13 @@ sub new {
     "threshold=i" => \(my $threshold = 80),
     "schema=s" => \my $schema,
     "verbose" => \my $verbose,
-    "parallel=i" => \(my $parallel = 1)
+    "parallel=i" => \(my $parallel = 1),
+    "help" => \my $help
   );
   GetOptions(
     %options
   ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
 
   my %args = ();
   foreach my $arg_key ( keys %options ) {

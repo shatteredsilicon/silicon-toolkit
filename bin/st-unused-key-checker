@@ -65,11 +65,13 @@ sub new {
     "summary!" => \(my $summary = 1),
     "set-vars=s%" => \my $set_vars,
     "show-usage-for-all-indexes" => \my $show_usage_for_all_indexes,
-    "ignore-low-uptime" => \my $ignore_low_uptime
+    "ignore-low-uptime" => \my $ignore_low_uptime,
+    "help" => \my $help
   );
   GetOptions(
     %options
   ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
 
   my %args = ();
   foreach my $arg_key ( keys %options ) {

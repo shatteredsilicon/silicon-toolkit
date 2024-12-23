@@ -54,11 +54,13 @@ sub new {
     "databases|d=s@" => \my $databases,
     "ignore-databases=s@" => \my $ignore_databases,
     "tables|t=s@" => \my $tables,
-    "ignore-tables=s@" => \my $ignore_tables
+    "ignore-tables=s@" => \my $ignore_tables,
+    "help" => \my $help
   );
   GetOptions(
     %options
   ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
 
   my %args = ();
   foreach my $arg_key ( keys %options ) {
