@@ -1,7 +1,7 @@
 # Silicon Toolkit
 Silicon Toolkit is a collection of advanced command-line tools used by
 Shattered Silicon (https://shatteredsilicon.net/) support staff to perform
-a variety of MySQL and system tasks that are too difficult or complex
+a variety of MySQL and system tasks that are too time consuming or complex
 to perform manually.
 
 These tools are ideal alternatives to private or "one-off" scripts because
