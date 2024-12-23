@@ -50,11 +50,13 @@ sub new {
     "charset|A=s" => \my $charset,
     "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
     "ask-pass" => \my $ask_pass,
-    "verbose" => \my $verbose
+    "verbose" => \my $verbose,
+    "help" => \my $help
   );
   GetOptions(
     %options
   ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
 
   my %args = ();
   foreach my $arg_key ( keys %options ) {
