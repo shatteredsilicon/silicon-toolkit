@@ -38,7 +38,7 @@ use Config::IniFiles;
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 sub new {
-  my ( $class, $opt_str ) = @_;
+  my ( $class ) = @_;
 
   my %options = (
     "user|u=s" => \my $user,
@@ -48,6 +48,7 @@ sub new {
     "port|P=i" => \(my $port = 3306),
     "database|D=s" => \my $database,
     "charset|A=s" => \my $charset,
+    "tables|t=s" => \my @tables,
     "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
     "ask-pass" => \my $ask_password,
     "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
@@ -67,14 +68,18 @@ sub new {
     my @name_str = split(/(=|\+|\!|:)/, $arg_key);
     my @names = split(/\|/, $name_str[0]);
     my $primary_name = $names[0];
-    $args{$primary_name} = ${$options{$arg_key}};
+    if (ref($options{$arg_key}) eq 'ARRAY') {
+      $args{$primary_name} = $options{$arg_key}
+    } else {
+      $args{$primary_name} = ${$options{$arg_key}};
+    }
   }
   my $self = {
     args => \%args
   };
 
-  if (defined $opt_str) {
-    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+  if ((scalar @ARGV) > 0) {
+    foreach my $opt ( split(qr/(?<!\\),/, $ARGV[0]) ) {
       $opt =~ s/\\,/,/g;
       if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
         foreach my $arg_key ( keys %options ) {
@@ -84,7 +89,11 @@ sub new {
 
           foreach my $name (@names[1..$#names]) {
             if ($name eq $opt_key) {
-              $self->{args}->{$primary_name} = $opt_val;
+              if (ref($self->{args}->{$primary_name}) eq 'ARRAY') {
+                push(@{$self->{args}->{$primary_name}}, $opt_val);
+              } else {
+                $self->{args}->{$primary_name} = $opt_val;
+              }
               last;
             }
           }
@@ -92,6 +101,11 @@ sub new {
       }
     }
   }
+
+  if ( (scalar @tables) > 0 ) {
+    my $tbls = \@tables;
+    $tbls = [ split(/,/,join(',',@tables)) ];
+  };
 
   STDEBUG && print "args: " . Dumper($self->{args});
 
@@ -333,9 +347,7 @@ use Text::Table;
 use Parallel::ForkManager;
 
 sub main {
-  my @ARGV = @_;
-
-  my $o = new Option(shift @ARGV);
+  my $o = new Option();
   $o->parse_dsn();
 
   my $database = $o->get_option('database');
@@ -366,42 +378,22 @@ sub main {
   );
 
   my $schema = $o->get_option('schema') || $database;
+  my $tables = $o->get_option('tables');
   my $threshold = $o->get_option('threshold');
   my $verbose = $o->get_option('verbose');
   my $parallel = $o->get_option('parallel');
 
   my $pm = Parallel::ForkManager->new($parallel);
 
-  # get list of schemas to be checked
-  my @schemas = ();
-  if ($schema) {
-    push @schemas, $schema;
-  } else {
-    eval { @schemas = @{$db->{dbh}->selectcol_arrayref("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')")} };
-    if ($EVAL_ERROR) {
-      $db->disconnect() if $db;
-      die "Can't get schema list: ${EVAL_ERROR}";
-    }
-  }
+  if ( defined $tables && (scalar @{$tables}) > 0 ) {
+    foreach my $table (@{$tables}) {
+      my ($schema_or_tbl, $tbl) = split('\.', "$table", 2);
+      if ( defined $tbl && $tbl eq '' ) { die "table name in '$table' is not given" };
 
-  STDEBUG && print "Schemas to be checked: " . join(", ", @schemas) . "\n";
+      my $sm = $schema || '';
+      if ( defined $tbl ) { $sm = $schema_or_tbl } else { $tbl = $schema_or_tbl };
 
-  foreach my $sm (@schemas) {
-    STDEBUG && print "Checking schema `${sm}`...\n";
-
-    my @tables = ();
-    eval { @tables = @{$db->{dbh}->selectcol_arrayref(
-        " SELECT TABLES.TABLE_NAME
-          FROM   information_schema.TABLES
-          WHERE  TABLES.TABLE_SCHEMA = " . $db->{dbh}->quote("$sm") . " AND
-                 TABLE_TYPE = 'BASE TABLE'")} };
-    if ($EVAL_ERROR) {
-      print "Can't get table list of schema `${sm}`: ${EVAL_ERROR}\n";
-      next;
-    }
-
-    foreach my $table (@tables) {
-      STDEBUG && print "Checking table `${sm}`.`${table}`...\n";
+      STDEBUG && print "Checking table `${sm}`.`${tbl}`...\n";
 
       my $dbh;
       if ($parallel > 1) {
@@ -413,62 +405,59 @@ sub main {
         $dbh = $db->{dbh};
       }
 
-      &{ sub {
-        my @columns = ();
-        eval { @columns = @{$dbh->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $dbh->quote("$sm") . " AND TABLE_NAME = " . $dbh->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'")} };
-        if ($EVAL_ERROR) {
-          print "Can't get column list of table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
-          return;
-        }
-
-        STDEBUG && print Dumper(@columns);
-
-        if ((scalar @columns) eq 0) {
-          return;
-        }
-
-        my @max_values = ();
-        eval { @max_values = @{$dbh->selectrow_arrayref("SELECT " . join(", ", map { "MAX(`" . $_->[0] . "`)" } @columns) . " FROM `${sm}`.`${table}`")} };
-        if ($EVAL_ERROR) {
-          print "Can't get maximum values of columns " . join(",", map {$_->[0]} @columns) . " for table `${sm}`.`${table}`: ${EVAL_ERROR}\n";
-          return;
-        }
-
-        my @titles = ('');
-        my @samples = ("${sm}.${table}");
-        my $exceed_threshold = 0;
-
-        foreach my $i (0 .. $#columns) {
-          my $max_value = 2147483647;
-          if ($columns[$i]->[1]) {
-            $max_value = 4294967295;
-          }
-
-          my $title = $columns[$i]->[0] . ($columns[$i]->[1] ? " (u)" : " (s)"),
-          my $sample = '' . ($max_values[$i] || 0);
-          if ((($max_values[$i] || 0) / $max_value) >= ($threshold / 100)) {
-            $title = colored(['red'], $title);
-            $sample = colored(['red'], $sample);
-            $exceed_threshold = 1;
-
-            push @titles, $title;
-            push @samples, $sample;
-          } elsif ($verbose) {
-            push @titles, $title;
-            push @samples, $sample;
-          }
-        }
-
-        # none of columns in this table exceeds threshold, ignore it
-        if (! $exceed_threshold) { return; };
-
-        my $tb = Text::Table->new(@titles);
-        $tb->load([@samples]);
-        print $tb . "\n";
-      } }();
+      check_int_columns($dbh, $sm, $tbl, $threshold, $verbose);
 
       if ($parallel > 1) {
         $pm->finish;
+      }
+    }
+  } else {
+    # get list of schemas to be checked
+    my @schemas = ();
+    if ($schema) {
+      push @schemas, $schema;
+    } else {
+      eval { @schemas = @{$db->{dbh}->selectcol_arrayref("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')")} };
+      if ($EVAL_ERROR) {
+        $db->disconnect() if $db;
+        die "Can't get schema list: ${EVAL_ERROR}";
+      }
+    }
+
+    STDEBUG && print "Schemas to be checked: " . join(", ", @schemas) . "\n";
+
+    foreach my $sm (@schemas) {
+      STDEBUG && print "Checking schema `${sm}`...\n";
+
+      my @tables = ();
+      eval { @tables = @{$db->{dbh}->selectcol_arrayref(
+          " SELECT TABLES.TABLE_NAME
+            FROM   information_schema.TABLES
+            WHERE  TABLES.TABLE_SCHEMA = " . $db->{dbh}->quote("$sm") . " AND
+                  TABLE_TYPE = 'BASE TABLE'")} };
+      if ($EVAL_ERROR) {
+        print "Can't get table list of schema `${sm}`: ${EVAL_ERROR}\n";
+        next;
+      }
+
+      foreach my $table (@tables) {
+        STDEBUG && print "Checking table `${sm}`.`${table}`...\n";
+
+        my $dbh;
+        if ($parallel > 1) {
+          $pm->start and next;
+
+          $dbh = $db->{dbh}->clone();
+          $db->{dbh}->{InactiveDestroy} = 1;
+        } else {
+          $dbh = $db->{dbh};
+        }
+
+        check_int_columns($dbh, $sm, $table, $threshold, $verbose);
+
+        if ($parallel > 1) {
+          $pm->finish;
+        }
       }
     }
   }
@@ -476,6 +465,62 @@ sub main {
   $pm->wait_all_children;
   $db->disconnect() if $db;
   return 0;
+}
+
+sub check_int_columns {
+  my ( $dbh, $schema, $table, $threshold, $verbose ) = @_;
+
+  my @columns = ();
+  eval { @columns = @{$dbh->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $dbh->quote("$schema") . " AND TABLE_NAME = " . $dbh->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'")} };
+  if ($EVAL_ERROR) {
+    print "Can't get column list of table `${schema}`.`${table}`: ${EVAL_ERROR}\n";
+    return;
+  }
+
+  STDEBUG && print Dumper(@columns);
+
+  if ((scalar @columns) eq 0) {
+    return;
+  }
+
+  my @max_values = ();
+  eval { @max_values = @{$dbh->selectrow_arrayref("SELECT " . join(", ", map { "MAX(`" . $_->[0] . "`)" } @columns) . " FROM `${schema}`.`${table}`")} };
+  if ($EVAL_ERROR) {
+    print "Can't get maximum values of columns " . join(",", map {$_->[0]} @columns) . " for table `${schema}`.`${table}`: ${EVAL_ERROR}\n";
+    return;
+  }
+
+  my @titles = ('');
+  my @samples = ("${schema}.${table}");
+  my $exceed_threshold = 0;
+
+  foreach my $i (0 .. $#columns) {
+    my $max_value = 2147483647;
+    if ($columns[$i]->[1]) {
+      $max_value = 4294967295;
+    }
+
+    my $title = $columns[$i]->[0] . ($columns[$i]->[1] ? " (u)" : " (s)"),
+    my $sample = '' . ($max_values[$i] || 0);
+    if ((($max_values[$i] || 0) / $max_value) >= ($threshold / 100)) {
+      $title = colored(['red'], $title);
+      $sample = colored(['red'], $sample);
+      $exceed_threshold = 1;
+
+      push @titles, $title;
+      push @samples, $sample;
+    } elsif ($verbose) {
+      push @titles, $title;
+      push @samples, $sample;
+    }
+  }
+
+  # none of columns in this table exceeds threshold, ignore it
+  if (! $exceed_threshold) { return; };
+
+  my $tb = Text::Table->new(@titles);
+  $tb->load([@samples]);
+  print $tb . "\n";
 }
 
 # ############################################################################
@@ -528,6 +573,14 @@ threshold (defaults to 80) of the column's maximum (2147483648 for signed,
 type: string
 
 The schema to be checked
+
+=item B<--tables>
+
+short form: -t; type: list
+
+Check only this list of tables.
+
+Table names may be qualified with the database name.
 
 =item B<--threshold>
 
@@ -616,6 +669,10 @@ Default character set.
 =item * D
 
 Default database.
+
+=item * t
+
+Table to be checked.
 
 =item * F
 
