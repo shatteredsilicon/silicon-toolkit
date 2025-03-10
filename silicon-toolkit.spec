@@ -9,7 +9,7 @@ Vendor:         Shattered Silicon Ltd
 URL:            https://shatteredsilicon.net
 Source0:        %{name}-%{version}-%{release}.tar.gz
 
-Requires: perl-DBI, perl-DBD-MySQL, MariaDB-shared
+Requires: perl-DBI, perl-DBD-MySQL
 
 Requires(post):     systemd
 Requires(preun):    systemd
