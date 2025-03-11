@@ -44,7 +44,7 @@ rpm: $(RPM_FILES)
 
 $(RPM_FILES): $(SRPM_FILE)
 	mkdir -vp $(BUILDDIR)/mock
-	mock -r ssm-9-$(ARCH) --resultdir $(BUILDDIR)/mock --rebuild $(SRPM_FILE)
+	mock -r oraclelinux-7-$(ARCH) --resultdir $(BUILDDIR)/mock --rebuild $(SRPM_FILE)
 
 	for rpm_file in $(RPM_FILES); do \
 		mkdir -vp $$(dirname $${rpm_file}); \
