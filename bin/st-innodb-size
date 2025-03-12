@@ -115,13 +115,20 @@ sub parse_dsn {
     "$ENV{HOME}/.my.cnf",
   );
 
+  my $fixed_options = {};
+  if ( $Config::IniFiles::VERSION >= '3.0' ) { # -php_compat was added in v3.0+
+    $fixed_options->{ -php_compat } = 1;
+  }
+
   # get credentials from files
   foreach my $conf_file (@conf_files) {
     if (! -e "$conf_file") {
       next;
     }
 
-    if (tie my %ini, 'Config::IniFiles', ( -file => "$conf_file", -php_compat => 1 )) {
+    my %options = %$fixed_options;
+    $options{ -file } = $conf_file;
+    if (tie my %ini, 'Config::IniFiles', %options) {
       if (!defined $ini{client}) {
         next;
       }
