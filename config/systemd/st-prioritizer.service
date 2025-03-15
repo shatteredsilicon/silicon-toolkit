@@ -1,0 +1,12 @@
+[Unit]
+Description=Silicon Tookit MySQL/MariaDB Thread Prioritizer
+After=mysql.service
+
+[Service]
+User=root
+ExecStart=/usr/bin/st-prioritizer
+Type=simple
+PIDFile=/run/st-prioritizer.pid
+
+[Install]
+WantedBy=multi-user.target

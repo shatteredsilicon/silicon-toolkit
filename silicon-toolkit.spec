@@ -41,12 +41,15 @@ install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
 
 %post
 %systemd_post st-sideload-relay.service
+%systemd_post st-prioritizer.service
 
 %preun
 %systemd_preun st-sideload-relay.service
+%systemd_preun st-prioritizer.service
 
 %postun
 %systemd_postun st-sideload-relay.service
+%systemd_postun st-prioritizer.service
 
 %clean
 rm -rf $RPM_BUILD_ROOT
