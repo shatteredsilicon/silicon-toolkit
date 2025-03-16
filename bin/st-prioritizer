@@ -1,0 +1,701 @@
+#!/usr/bin/env perl
+
+# This is st-prioritizer, a program to manage the priority of threads
+# that operating slow queries within the MySQL/MariaDB server.
+#
+# Copyright (C) 2025  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class ) = @_;
+
+  my %options = (
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
+    "ask-pass" => \my $ask_password,
+    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
+    "interval|i=i" => \(my $interval = 60),
+    "threshold|t=i" => \(my $threshold = 60),
+    "progressive|r" => \my $progressive,
+    "one-shot|1" => \my $one_shot,
+    "reset-on-exit" => \my $reset_on_exit,
+    "prioritize-replication:s" => \my $prioritize_replication,
+    "pid-file=s" => \(my $pid_file = '/run/st-prioritizer.pid'),
+    "help" => \my $help
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
+
+  my %args = ();
+  foreach my $arg_key ( keys %options ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+    if (ref($options{$arg_key}) eq 'ARRAY') {
+      $args{$primary_name} = $options{$arg_key}
+    } else {
+      $args{$primary_name} = ${$options{$arg_key}};
+    }
+  }
+  my $self = {
+    args => \%args
+  };
+
+  if ((scalar @ARGV) > 0) {
+    foreach my $opt ( split(qr/(?<!\\),/, $ARGV[0]) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              if (ref($self->{args}->{$primary_name}) eq 'ARRAY') {
+                push(@{$self->{args}->{$primary_name}}, $opt_val);
+              } else {
+                $self->{args}->{$primary_name} = $opt_val;
+              }
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  my $fixed_options = {};
+  if ( $Config::IniFiles::VERSION >= '3.0' ) { # -php_compat was added in v3.0+
+    $fixed_options->{ -php_compat } = 1;
+  }
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    STDEBUG && print $conf_file . "\n";
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    my %options = %$fixed_options;
+    $options{ -file } = $conf_file;
+    if (tie my %ini, 'Config::IniFiles', %options) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # read default socket path from output of
+  # 'mysql --print-defaults'
+  my $mysqlbinlog_cli = $self->get_option('mysql-cli');
+  open FH, "${mysqlbinlog_cli} --print-defaults |";
+	my @lines = <FH>;
+	close FH;
+
+  foreach my $line (@lines) {
+    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
+      $self->{args}->{socket} = "$path";
+      last;
+    }
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 1,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if (defined $socket && $socket ne '') {
+    $dsn = "${dsn};${socket_opt}=${socket}";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host}";
+  }
+
+  if (defined $database && $database ne '') {
+    $dsn = "${dsn};database=${database}";
+  }
+
+  if (defined $charset && $charset ne '') {
+    $dsn = "${dsn};charset=${charset}";
+  }
+
+  if (defined $mysql_read_default_file && $mysql_read_default_file ne '') {
+    $dsn = "${dsn};mysql_read_default_file=${mysql_read_default_file}";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_prioritizer program.
+# ############################################################################
+package st_prioritizer;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Capture::Tiny ':all';
+use Term::ANSIColor qw(colored);
+use Proc::Pidfile;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my $DEFAULT_REPLICATION_NICENESS = -15;
+my @REPLICATION_THREAD_NAMES = ('thread/sql/slave_io', 'thread/sql/slave_sql', 'thread/sql/rpl_parallel_thread', 'thread/sql/replica_io', 'thread/sql/replica_sql', 'thread/sql/replica_worker');
+
+sub main {
+  my $o = new Option();
+  $o->parse_dsn();
+
+  my $pidfile = Proc::Pidfile->new(
+    pidfile => $o->get_option('pid-file'),
+  );
+
+  my $password = $o->get_option('password');
+  if ($o->get_option('ask-pass')) {
+    eval {
+      require Term::ReadKey;
+      Term::ReadKey::ReadMode('noecho');
+      chomp($password = <STDIN>);
+      Term::ReadKey::ReadMode('normal');
+      print "\n"
+         or die "Cannot print: $OS_ERROR";
+    };
+    if ( $EVAL_ERROR ) {
+        die "Cannot read response; is Term::ReadKey installed? $EVAL_ERROR";
+    }
+  }
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $password,
+    mysql_read_default_file => $o->get_option('mysql-read-default-file')
+  );
+
+  my $interval = $o->get_option('interval');
+  my $threshold = $o->get_option('threshold');
+  my $progressive = $o->get_option('progressive');
+  my $one_shot = $o->get_option('one-shot');
+  my $reset_on_exit = $o->get_option('reset-on-exit');
+  my $prioritize_replication = $o->get_option('prioritize-replication');
+
+  if (defined $prioritize_replication) {
+    if ($prioritize_replication =~ /^[+-]?\d+$/) {
+      if ($prioritize_replication < -20 || $prioritize_replication > 19) { die "Value of --prioritize-replication should be in range [-20, 19]"; }
+    } elsif ($prioritize_replication eq '') {
+      $prioritize_replication = $DEFAULT_REPLICATION_NICENESS;
+    } else { die "Value of --prioritize-replication should be an integer"; }
+  }
+
+  my $performance_schema;
+  eval { $performance_schema = $db->{dbh}->selectrow_arrayref('SELECT @@performance_schema')->[0] };
+  if ($EVAL_ERROR) {
+    die "Can't get global variable \@\@performance_schema: ${EVAL_ERROR}";
+  }
+
+  if (!$performance_schema) {
+    die "This tool relies on performance_schema";
+  }
+
+  my $thread_os_id_exists;
+  eval { $thread_os_id_exists = $db->{dbh}->selectrow_arrayref("SELECT 1 FROM information_schema.columns WHERE table_schema = 'performance_schema' AND table_name = 'threads' AND column_name = 'THREAD_OS_ID'")->[0] };
+  if ($EVAL_ERROR) {
+    die "Can't check whether THREAD_OS_ID column exists: ${EVAL_ERROR}";
+  }
+
+  if (!$thread_os_id_exists) {
+    die "This tool relies on performance_schema.threads.THREAD_OS_ID column, and it is missing on this system.\nTHREAD_OS_ID was added in MySQL 5.7 and MariaDB 10.5 and doesn't exist on older versions.";
+  }
+
+  my $reset_niceness = {};
+  $SIG{INT} = sub { my ($signal) = @_; terminate_handler($signal, $reset_niceness, $reset_on_exit); };
+  $SIG{TERM} = sub { my ($signal) = @_; terminate_handler($signal, $reset_niceness, $reset_on_exit); };
+
+  my $restart_signal = 0;
+  $SIG{USR1} = sub { $restart_signal =  1; };
+
+  while (1) {
+    my $thread_rows;
+    eval { $thread_rows = $db->{dbh}->selectall_arrayref("
+      SELECT
+        NAME,
+        PROCESSLIST.USER AS User,
+        PROCESSLIST_HOST AS Host,
+        PROCESSLIST_COMMAND AS Command,
+        PROCESSLIST_TIME AS Time,
+        THREAD_OS_ID
+      FROM performance_schema.threads threads
+      LEFT JOIN information_schema.PROCESSLIST PROCESSLIST ON threads.PROCESSLIST_ID = PROCESSLIST.ID 
+      WHERE
+        (TYPE = 'FOREGROUND' AND PROCESSLIST_COMMAND = 'Query')
+        OR
+        NAME IN ('" . join("', '", @REPLICATION_THREAD_NAMES) . "')
+        OR
+        PROCESSLIST.USER = 'system user'
+      ", { Slice => {} })
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get performance_schema.threads: ${EVAL_ERROR}";
+    }
+
+    foreach my $thread_row (@{$thread_rows}) {
+      my $is_replication_thread = grep(/$thread_row->{NAME}/, @REPLICATION_THREAD_NAMES) || $thread_row->{User} eq 'system user';
+      if ((!defined $prioritize_replication && $is_replication_thread) || (!$is_replication_thread && $thread_row->{Time} < $threshold)) {
+        next;
+      }
+
+      STDEBUG && print "checking thread row: " . Dumper($thread_row);
+
+      my @lines = grep { /^\s*$thread_row->{THREAD_OS_ID}\s+/ } `ps -AL -o tid=,ni=`;
+	    my $ps_exit = $? >> 8;
+      if ($ps_exit != 0) {
+        warn "WARNING: can't get niceness of PID $thread_row->{THREAD_OS_ID}, exit code: $ps_exit";
+        next;
+      }
+
+      if (scalar @lines == 0) { next; }
+
+      my $niceness = (split(" ", $lines[0]))[1];
+      my $reniceness;
+      if ($is_replication_thread) {
+        if ($niceness == $prioritize_replication) { next; }
+        $reniceness = $prioritize_replication;
+      } elsif ($niceness >= 19) {
+        next;
+      } elsif ($progressive) {
+        $reniceness = $niceness + 1;
+      } else {
+        $reniceness = 19;
+      }
+
+      STDEBUG && print "renicing TID $thread_row->{THREAD_OS_ID} with niceness $reniceness...\n";
+
+      my $renice_exit = system "renice -n $reniceness $thread_row->{THREAD_OS_ID} >/dev/null 2>/dev/null";
+      $renice_exit == 0 or warn "WARNING: can't renice TID $thread_row->{THREAD_OS_ID} with reniceness $reniceness, exit code: $renice_exit";
+      if ($renice_exit == 0 && !defined $reset_niceness->{$thread_row->{THREAD_OS_ID}}) { $reset_niceness->{$thread_row->{THREAD_OS_ID}} = $niceness; }
+    }
+
+    defined $one_shot && last;
+
+    if (!$restart_signal) { my $slept_seconds = sleep($interval); STDEBUG && print "interval is $interval seconds, slept ${slept_seconds} seconds\n" }
+    $restart_signal = 0;
+  }
+
+  if (!$one_shot && $reset_on_exit) {
+    set_niceness($reset_niceness);
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+sub terminate_handler {
+  my ($signal, $reset_niceness, $reset_on_exit) = @_;
+
+  STDEBUG && print "got a signal '$signal' that's handled by terminate_handler\n";
+
+  if ($reset_on_exit) { set_niceness($reset_niceness); }
+
+  die "Caught a signal $signal";
+}
+
+sub set_niceness {
+  my ($set_niceness) = @_;
+
+  foreach my $key (keys %$set_niceness) {
+    my $renice_exit = system "renice -n $set_niceness->{$key} $key >/dev/null 2>/dev/null";
+    $renice_exit == 0 or warn "WARNING: can't reset niceness of $key to $set_niceness->{$key}, exit code: $renice_exit";
+  }
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-prioritizer - a program to manage the priority of threads that operating 
+slow queries within the MySQL/MariaDB server.
+
+=head1 SYNOPSIS
+
+Usage: st-prioritizer [OPTION...] [DSN]
+
+st-prioritizer manages the priority of threads that operating slow queries 
+within the MySQL/MariaDB server.
+
+Example:
+
+  st-prioritizer
+
+  st-prioritizer -u mysql -h localhost
+
+  st-prioritizer u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-prioritizer polls running threads every --interval seconds, and re-prioritise
+non system user threads or replication threads.
+
+=head1 OPTIONS
+
+=over 8
+
+-item B<--interval>
+
+short form: -i; type: integer; default: 60
+
+Interval (seconds) for polling running threads
+
+=item B<--threshold>
+
+short form: -t; type: integer; default: 60
+
+Only show the column that its maximum value exceeds this threshold (percent)
+
+=item B<--progressive>
+
+short form: -r; type: boolean; default: false
+
+Whether to renice the process progressive.
+
+=item B<--one-shot>
+
+short form: -1; type: boolean; default: false
+
+Whether to exit once it re-priorities all threads (no loop).
+
+=item B<--reset-on-exit>
+
+type: boolean; default: false
+
+Wheter to reset the priority of threads on exit.
+
+=item B<--prioritize-replication>
+
+type: integer; default: -15
+
+The niceness [-20, 19] for replication threads.
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--mysql-read-default-file>
+
+short form: -F; type: string
+
+Only read mysql options from the given file.
+
+=item B<--ask-pass>
+
+type: boolean; default: false
+
+Prompt for a password when connecting to MySQL.
+
+=item B<--mysql-cli>
+
+default: mysql
+
+Name/Path of mysql cli.
+
+=item B<--pid-file>
+
+type: string; default: /run/st-prioritizer.pid
+
+Pid file.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=back
+
+=head1 DSN OPTIONS
+
+These DSN options are used to create a DSN.  Each option is given like
+C<option=value>.  The options are case-sensitive, so P and p are not the
+same option.  There cannot be whitespace before or after the C<=> and
+if the value contains whitespace it must be quoted.  DSN options are
+comma-separated.
+
+=over
+
+=item * F
+
+Only read default options from the given file
+
+=item * h
+
+Connect to host.
+
+=item * p
+
+Password to use when connecting.
+If password contains commas they must be escaped with a backslash: "exam\,ple"
+
+=item * P
+
+Port number to use for connection.
+
+=item * S
+
+Socket file to use for connection.
+
+=item * u
+
+User for login if not current user.
+
+=cut
