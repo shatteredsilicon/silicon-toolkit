@@ -58,6 +58,7 @@ sub new {
     "lock-file=s" => \my $lock_file,
     "verbose|v" => \my $verbose,
     "min-lag=i" => \(my $min_lag = 5),
+    "st-prioritizer-pid-file=s" => \(my $st_prioritizer_pid_file = '/run/st-prioritizer.pid'),
     "help" => \my $help
   );
   GetOptions(
@@ -81,7 +82,8 @@ sub new {
       'mysqlbinlog-cli' => $mysqlbinlog_cli,
       "lock-file" => $lock_file,
       "verbose" => $verbose,
-      "min-lag" => $min_lag
+      "min-lag" => $min_lag,
+      "st-prioritizer-pid-file" => $st_prioritizer_pid_file
     },
   };
 
@@ -404,6 +406,8 @@ sub main {
   my $lock_file = $o->get_option('lock-file');
   my $verbose = $o->get_option('verbose');
   my $min_lag = $o->get_option('min-lag');
+
+  my $st_prioritizer_pid_file = $o->get_option('st-prioritizer-pid-file');
 
   if (!defined $lock_file || $lock_file eq "") {
     $lock_file = "/var/lock/stsr";
@@ -944,6 +948,13 @@ sub main {
       warn "Can't start sql_thread for channel '$channel_name': ${EVAL_ERROR}";
       next EVENT;
     }
+
+    # a hook to trigger restart of st-prioritizer
+    if (defined $st_prioritizer_pid_file && -e $st_prioritizer_pid_file) {
+      my $st_prioritizer_pid = `cat $st_prioritizer_pid_file`;
+      STDEBUG && print "sending USR1 signal to pid: $st_prioritizer_pid\n";
+      kill 'USR1', $st_prioritizer_pid;
+    }
   }
 
   ensure_slave_io_thread($db, $init_slave_status, $channel_name, $mariadb_channel_arg, $mysql_channel_arg);
@@ -1115,6 +1126,12 @@ Name/Path of mysql cli.
 default: mysqlbinlog
 
 Name/Path of mysqlbinlog cli.
+
+=item B<--st-prioritizer-pid-file>
+
+default: /run/st-prioritizer.pid
+
+Pid file of st-prioritizer programe.
 
 =item B<--help>
 

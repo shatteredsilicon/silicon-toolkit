@@ -55,6 +55,7 @@ sub new {
     "one-shot|1" => \my $one_shot,
     "reset-on-exit" => \my $reset_on_exit,
     "prioritize-replication:s" => \my $prioritize_replication,
+    "pid-file=s" => \(my $pid_file = '/run/st-prioritizer.pid'),
     "help" => \my $help
   );
   GetOptions(
@@ -343,6 +344,7 @@ use English qw(-no_match_vars);
 use Data::Dumper;
 use Capture::Tiny ':all';
 use Term::ANSIColor qw(colored);
+use Proc::Pidfile;
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 my $DEFAULT_REPLICATION_NICENESS = -15;
@@ -351,6 +353,10 @@ my @REPLICATION_THREAD_NAMES = ('thread/sql/slave_io', 'thread/sql/slave_sql', '
 sub main {
   my $o = new Option();
   $o->parse_dsn();
+
+  my $pidfile = Proc::Pidfile->new(
+    pidfile => $o->get_option('pid-file'),
+  );
 
   my $password = $o->get_option('password');
   if ($o->get_option('ask-pass')) {
@@ -415,6 +421,9 @@ sub main {
   $SIG{INT} = sub { my ($signal) = @_; terminate_handler($signal, $reset_niceness, $reset_on_exit); };
   $SIG{TERM} = sub { my ($signal) = @_; terminate_handler($signal, $reset_niceness, $reset_on_exit); };
 
+  my $restart_signal = 0;
+  $SIG{USR1} = sub { $restart_signal =  1; };
+
   while (1) {
     my $thread_rows;
     eval { $thread_rows = $db->{dbh}->selectall_arrayref("
@@ -477,7 +486,9 @@ sub main {
     }
 
     defined $one_shot && last;
-    sleep($interval);
+
+    if (!$restart_signal) { my $slept_seconds = sleep($interval); STDEBUG && print "interval is $interval seconds, slept ${slept_seconds} seconds\n" }
+    $restart_signal = 0;
   }
 
   if (!$one_shot && $reset_on_exit) {
@@ -635,6 +646,12 @@ Prompt for a password when connecting to MySQL.
 default: mysql
 
 Name/Path of mysql cli.
+
+=item B<--pid-file>
+
+type: string; default: /run/st-prioritizer.pid
+
+Pid file.
 
 =item B<--help>
 
