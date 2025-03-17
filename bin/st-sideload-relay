@@ -58,7 +58,7 @@ sub new {
     "lock-file=s" => \my $lock_file,
     "verbose|v" => \my $verbose,
     "min-lag=i" => \(my $min_lag = 5),
-    "st-prioritizer-pid-file=s" => \(my $st_prioritizer_pid_file = '/run/st-prioritizer.pid'),
+    "st-prioritizer-pid-file:s" => \my $st_prioritizer_pid_file,
     "help" => \my $help
   );
   GetOptions(
@@ -382,6 +382,8 @@ my %MASTER_INFO_FIELD_LINES = (
   'Tls_ciphersuites' => 29
 );
 
+my $DEFUALT_ST_PRIORITIZER_PID_FILE = '/run/st-prioritizer.pid';
+
 sub main {
   my @ARGV = @_;
 
@@ -408,6 +410,7 @@ sub main {
   my $min_lag = $o->get_option('min-lag');
 
   my $st_prioritizer_pid_file = $o->get_option('st-prioritizer-pid-file');
+  if (defined $st_prioritizer_pid_file && $st_prioritizer_pid_file eq '') { $st_prioritizer_pid_file = $DEFUALT_ST_PRIORITIZER_PID_FILE; }
 
   if (!defined $lock_file || $lock_file eq "") {
     $lock_file = "/var/lock/stsr";
@@ -950,10 +953,20 @@ sub main {
     }
 
     # a hook to trigger restart of st-prioritizer
-    if (defined $st_prioritizer_pid_file && -e $st_prioritizer_pid_file) {
+    if (defined $st_prioritizer_pid_file && -e $st_prioritizer_pid_file && -s $st_prioritizer_pid_file) {
       my $st_prioritizer_pid = `cat $st_prioritizer_pid_file`;
-      STDEBUG && print "sending USR1 signal to pid: $st_prioritizer_pid\n";
-      kill 'USR1', $st_prioritizer_pid;
+      chomp($st_prioritizer_pid);
+      my $st_prioritizer_pid_command = `cat /proc/$st_prioritizer_pid/cmdline`;
+      chomp($st_prioritizer_pid_command);
+      my $ps_exit = $? >> 8;
+      if ($ps_exit != 0 || !defined $st_prioritizer_pid_command || $st_prioritizer_pid_command eq '') {
+        warn "Unable to get the command of PID $st_prioritizer_pid, exit code: $ps_exit";
+      } elsif ($st_prioritizer_pid_command =~ m/^perl.*\/st-prioritizer/) {
+        STDEBUG && print "sending USR1 signal to pid: $st_prioritizer_pid\n";
+        kill 'USR1', $st_prioritizer_pid;
+      } else {
+        warn "Can't verify that PID $st_prioritizer_pid is owned by st-prioritizer, whether it's taken by another program or the name of st-prioritizer has been changed";
+      }
     }
   }
 
