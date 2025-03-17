@@ -448,6 +448,7 @@ sub main {
       die "Can't get performance_schema.threads: ${EVAL_ERROR}";
     }
 
+    my @existing_thread_ids = ();
     foreach my $thread_row (@{$thread_rows}) {
       my $is_replication_thread = grep(/$thread_row->{NAME}/, @REPLICATION_THREAD_NAMES) || $thread_row->{User} eq 'system user';
       if ((!defined $prioritize_replication && $is_replication_thread) || (!$is_replication_thread && $thread_row->{Time} < $threshold)) {
@@ -455,6 +456,8 @@ sub main {
       }
 
       STDEBUG && print "checking thread row: " . Dumper($thread_row);
+
+      push @existing_thread_ids, $thread_row->{THREAD_OS_ID};
 
       my @lines = grep { /^\s*$thread_row->{THREAD_OS_ID}\s+/ } `ps -AL -o tid=,ni=`;
 	    my $ps_exit = $? >> 8;
@@ -482,7 +485,12 @@ sub main {
 
       my $renice_exit = system "renice -n $reniceness $thread_row->{THREAD_OS_ID} >/dev/null 2>/dev/null";
       $renice_exit == 0 or warn "WARNING: can't renice TID $thread_row->{THREAD_OS_ID} with reniceness $reniceness, exit code: $renice_exit";
-      if ($renice_exit == 0 && !defined $reset_niceness->{$thread_row->{THREAD_OS_ID}}) { $reset_niceness->{$thread_row->{THREAD_OS_ID}} = $niceness; }
+      if ($renice_exit == 0 && $reset_on_exit && !defined $reset_niceness->{$thread_row->{THREAD_OS_ID}}) { $reset_niceness->{$thread_row->{THREAD_OS_ID}} = $niceness; }
+    }
+
+    # remove stale thread ids
+    foreach my $key (keys %{$reset_niceness}) {
+      if (!grep(/$key/, @existing_thread_ids)) { delete $reset_niceness->{$key}; }
     }
 
     defined $one_shot && last;
