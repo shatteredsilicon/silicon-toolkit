@@ -564,10 +564,29 @@ sub main {
   STDEBUG && print Dumper($init_slave_status);
 
   my $initial_run = 1;
+  my $db_reconnect_count = 0;
+  my $db_reconnect_limit = 10;
 
   EVENT:
   while (1) {
-    sleep 1;
+    if ($db->{dbh}->ping) {
+      sleep(1);
+    } else {
+      if ($db_reconnect_count >= $db_reconnect_limit) {
+        warn "Failed to reconnect to database (tried $db_reconnect_limit times)";
+        last EVENT;
+      }
+      warn "Connection to database lost, trying to sleep 1min and reconnect...";
+      sleep(60);
+      eval { $db->{dbh}->disconnect; $db->{dbh} = $db->{dbh}->clone(); };
+      if ($EVAL_ERROR) {
+        warn "Failed to reconnect to database: $EVAL_ERROR";
+        $db_reconnect_count = $db_reconnect_count + 1;
+        next EVENT;
+      } else {
+        $db_reconnect_count = 0;
+      }
+    }
 
     # get slave status
     my $slave_status;
@@ -592,8 +611,8 @@ sub main {
     # stop io_thread
     eval { $db->{dbh}->do("STOP SLAVE ${mariadb_channel_arg} io_thread ${mysql_channel_arg}") };
     if ($EVAL_ERROR) {
-      $db->disconnect() if $db;
-      die "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
+      warn "Can't stop io_thread for channel '$channel_name': ${EVAL_ERROR}";
+      next EVENT;
     }
 
     # get latest slave status after stoping the io_thread
