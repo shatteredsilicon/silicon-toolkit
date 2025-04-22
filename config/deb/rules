@@ -17,3 +17,7 @@ override_dh_auto_install:
 	install -d $(TMP)
 	cp silicon-toolkit/bin/* $(TMP)/
 	cp silicon-toolkit/config/systemd/*.service $(TMP)/
+
+override_dh_systemd_enable:
+
+override_dh_systemd_start:
