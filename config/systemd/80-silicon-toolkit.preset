@@ -1,0 +1,2 @@
+disable st-prioritizer.service
+disable st-sideload-relay.service
