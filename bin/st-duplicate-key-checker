@@ -1148,9 +1148,9 @@ sub new {
       defaults_to       => {},  # rule: opt defaults to value of other opt
       DSNParser         => undef,
       default_files     => [
-         "/etc/percona-toolkit/percona-toolkit.conf",
-         "/etc/percona-toolkit/$program_name.conf",
-         "$home/.percona-toolkit.conf",
+         "/etc/silicon-toolkit/silicon-toolkit.conf",
+         "/etc/silicon-toolkit/$program_name.conf",
+         "$home/.silicon-toolkit.conf",
          "$home/.$program_name.conf",
       ],
       types             => {
