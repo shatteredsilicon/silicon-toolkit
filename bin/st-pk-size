@@ -1,0 +1,773 @@
+#!/usr/bin/env perl
+
+# This is st-pk-size, a program to compute size of primary keys
+# for each storage engine of MySQL/MariaDB.
+#
+# Copyright (C) 2025  Shattered Silicon Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
+use strict;
+use warnings FATAL => 'all';
+
+our $VERSION = '1.0.0';
+
+# ############################################################################
+# Option package
+# ############################################################################
+package Option;
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case auto_version);
+use English qw(-no_match_vars);
+use Pod::Usage;
+use Data::Dumper;
+use Config::IniFiles;
+use Scalar::Util qw(looks_like_number);
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+sub new {
+  my ( $class ) = @_;
+
+  my %options = (
+    "user|u=s" => \my $user,
+    "password|p=s" => \my $password,
+    "host|h=s" => \my $host,
+    "socket|S=s" => \my $socket,
+    "port|P=i" => \(my $port = 3306),
+    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
+    "ask-pass" => \my $ask_password,
+    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
+    "cache-file=s" => \(my $cache_file = '/tmp/.st-pk-size.cache'),
+    "top-tables=s" => \(my $top_tables = '20'),
+    "force-refresh" => \(my $force_refresh),
+    "engine=s" => \(my $engine = 'all'),
+    "json" => \my $json,
+    "help" => \my $help
+  );
+  GetOptions(
+    %options
+  ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $help;
+
+  my %args = ();
+  foreach my $arg_key ( keys %options ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+    if (ref($options{$arg_key}) eq 'ARRAY') {
+      $args{$primary_name} = $options{$arg_key}
+    } else {
+      $args{$primary_name} = ${$options{$arg_key}};
+    }
+  }
+  my $self = {
+    args => \%args
+  };
+
+  if ((scalar @ARGV) > 0) {
+    foreach my $opt ( split(qr/(?<!\\),/, $ARGV[0]) ) {
+      $opt =~ s/\\,/,/g;
+      if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
+        foreach my $arg_key ( keys %options ) {
+          my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+          my @names = split(/\|/, $name_str[0]);
+          my $primary_name = $names[0];
+
+          foreach my $name (@names[1..$#names]) {
+            if ($name eq $opt_key) {
+              if (ref($self->{args}->{$primary_name}) eq 'ARRAY') {
+                push(@{$self->{args}->{$primary_name}}, $opt_val);
+              } else {
+                $self->{args}->{$primary_name} = $opt_val;
+              }
+              last;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!looks_like_number($top_tables) && "$top_tables" ne 'all') {
+    pod2usage(-verbose => 1);
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+
+  return bless $self, $class;
+}
+
+sub get_option {
+  my ( $self, $key ) = @_;
+
+  return $self->{args}->{$key};
+}
+
+sub parse_dsn {
+  my ( $self ) = @_;
+
+  my @conf_files = (
+    "/etc/my.cnf",
+    "/etc/mysql/my.cnf",
+    "/usr/etc/my.cnf",
+    "$ENV{HOME}/.my.cnf",
+  );
+
+  my $fixed_options = {};
+  if ( $Config::IniFiles::VERSION >= '3.0' ) { # -php_compat was added in v3.0+
+    $fixed_options->{ -php_compat } = 1;
+  }
+
+  # get credentials from files
+  foreach my $conf_file (@conf_files) {
+    STDEBUG && print $conf_file . "\n";
+    if (! -e "$conf_file") {
+      next;
+    }
+
+    my %options = %$fixed_options;
+    $options{ -file } = $conf_file;
+    if (tie my %ini, 'Config::IniFiles', %options) {
+      if (!defined $ini{client}) {
+        next;
+      }
+
+      if (defined $ini{client}{user} && !defined $self->{args}->{user}) {
+        $self->{args}->{user} = $ini{client}{user};
+      }
+
+      if (defined $ini{client}{password} && !defined $self->{args}->{password}) {
+        $self->{args}->{password} = $ini{client}{password};
+      }
+
+      if (defined $ini{client}{host} && !defined $self->{args}->{host}) {
+        $self->{args}->{host} = $ini{client}{host};
+      }
+
+      if (defined $ini{client}{port} && !defined $self->{args}->{port}) {
+        $self->{args}->{port} = $ini{client}{port};
+      }
+
+      if (defined $ini{client}{socket} && !defined $self->{args}->{socket}) {
+        $self->{args}->{socket} = $ini{client}{socket};
+      }
+    }
+  }
+
+  # user still not defined, set user to
+  # current login user
+  if (!defined $self->{args}->{user}) {
+    $self->{args}->{user} = $ENV{LOGNAME} || getpwuid($<) || $ENV{USER} . '@localhost';
+  }
+
+  if (defined $self->{args}->{host} || defined $self->{args}->{socket}) {
+    return;
+  }
+
+  # read default socket path from output of
+  # 'mysql --print-defaults'
+  my $mysqlbinlog_cli = $self->get_option('mysql-cli');
+  open FH, "${mysqlbinlog_cli} --print-defaults |";
+	my @lines = <FH>;
+	close FH;
+
+  foreach my $line (@lines) {
+    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
+      $self->{args}->{socket} = "$path";
+      last;
+    }
+  }
+
+  # can't get default socket patch, use
+  # default host 'localhost'
+  if (!defined $self->{args}->{socket}) {
+    $self->{args}->{host} = 'localhost';
+  }
+
+  STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+# ############################################################################
+# DB package
+# ############################################################################
+package DB;
+
+use strict;
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my @DB_TRUES = (1,"true","True","TRUE","yes","Yes","YES","on","On","ON");
+
+eval {
+   require DBI;
+};
+my $have_dbi = $EVAL_ERROR ? 0 : 1;
+
+sub new {
+  my ( $class, %args ) = @_;
+  $args{attrs} ||= {};
+
+  my $defaults = {
+    AutoCommit         => 1,
+    RaiseError         => 1,
+    PrintError         => 0,
+    ShowErrorStatement => 1,
+    mysql_enable_utf8 => (defined $args{dsn} && $args{dsn} =~ m/charset=utf8/i ? 1 : 0),
+  };
+  @{$defaults}{ keys %{$args{attrs}} } = values %{$args{attrs}};
+
+  if ( !$have_dbi ) {
+    die "Cannot connect to MySQL because the Perl DBI module is not "
+        . "installed or not found.  Run 'perl -MDBI' to see the directories "
+        . "that Perl searches for DBI.  If DBI is not installed, try:\n"
+        . "  Debian/Ubuntu  apt-get install libdbi-perl\n"
+        . "  RHEL/CentOS    yum install perl-DBI\n"
+        . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
+  }
+
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file});
+  if ($dsn =~ m/DBI:MariaDB/) {
+    delete $defaults->{mysql_enable_utf8};
+  }
+
+  STDEBUG && print "dsn: $dsn\n";
+
+  my $dbh;
+  my $tries = 2;
+  while ( !$dbh && $tries-- ) {
+    eval {
+        $dbh = DBI->connect($dsn, $args{user}, $args{password}, $defaults);
+    };
+    if ( !$dbh && $EVAL_ERROR ) {
+        if ( $EVAL_ERROR =~ m/not a compiled character set|character set utf8/ ) {
+          STDEBUG && print 'Going to try again without utf8 support';
+          delete $defaults->{mysql_enable_utf8};
+        }
+        elsif ( $EVAL_ERROR =~ m/locate DBD\/(mysql|MariaDB)/i ) {
+          die "Cannot connect to MySQL/MariaDB because the Perl DBD::mysql/DBD::MariaDB module is "
+              . "not installed or not found.  Run 'perl -MDBD::mysql'/'perl -MDBD::MariaDB' to see "
+              . "the directories that Perl searches for DBD::mysql/DBD::MariaDB.  If "
+              . "DBD::mysql/DBD::MariaDB is not installed, try:\n"
+              . "  Debian/Ubuntu  apt-get install libdbd-mysql-perl/libdbd-mariadb-perl\n"
+              . "  RHEL/CentOS    yum install perl-DBD-MySQL/perl-DBD-MariaDB\n"
+              . "  OpenSolaris    pgk install pkg:/SUNWapu13dbd-mysql\n";
+        }
+        if ( !$tries ) {
+          die $EVAL_ERROR;
+        }
+    }
+  }
+
+  STDEBUG && print 'DBH info: ',
+    $dbh,
+    Dumper($dbh->selectrow_hashref(
+        'SELECT DATABASE(), CONNECTION_ID(), VERSION()/*!50038 , @@hostname*/')),
+    'Character set info:',   Dumper($dbh->selectall_arrayref(
+                    'SHOW VARIABLES LIKE "character_set%"', { Slice => {}})),
+    '$DBI::VERSION:',        $DBI::VERSION, "\n";
+
+  my $self = {
+    dbh => $dbh,
+  };
+
+  return bless $self, $class;
+}
+
+sub get_dbi_dsn {
+  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file ) = @_;
+
+  if (!$host && !$socket) {
+    return undef;
+  }
+
+  my $dsn;
+  my $socket_opt;
+  eval{ require DBD::MariaDB };
+  if ($@) {
+    $dsn = "DBI:mysql:mysql_auto_reconnect=1";
+    $socket_opt = 'socket';
+  } else {
+    $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
+    $socket_opt = 'mariadb_socket';
+  };
+
+  if (defined $socket && $socket ne '') {
+    $dsn = "${dsn};${socket_opt}=${socket}";
+  } else {
+    $dsn = "${dsn};port=${port};host=${host}";
+  }
+
+  if (defined $database && $database ne '') {
+    $dsn = "${dsn};database=${database}";
+  }
+
+  if (defined $charset && $charset ne '') {
+    $dsn = "${dsn};charset=${charset}";
+  }
+
+  if (defined $mysql_read_default_file && $mysql_read_default_file ne '') {
+    $dsn = "${dsn};mysql_read_default_file=${mysql_read_default_file}";
+  }
+
+  return $dsn;
+}
+
+sub disconnect {
+  my ( $self ) = @_;
+  $self->{dbh}->disconnect();
+}
+
+sub is_true {
+  my ( $self, $value ) = @_;
+  return grep $_ eq $value, @DB_TRUES;
+}
+
+# ############################################################################
+# st_pk_size program.
+# ############################################################################
+package st_pk_size;
+
+use warnings FATAL => 'all';
+use English qw(-no_match_vars);
+use Data::Dumper;
+use Capture::Tiny ':all';
+use Term::ANSIColor qw(colored);
+use JSON qw(encode_json decode_json to_json);
+use Text::Table;
+use Fcntl qw(O_WRONLY O_TRUNC O_CREAT);
+use constant STDEBUG => $ENV{STDEBUG} || 0;
+
+my $max_width = 74;
+my $hdr_width = $max_width - 2;  # for '# '
+my $hdr_fmt   = "# %-${hdr_width}s\n";
+
+sub main {
+  my $o = new Option();
+  $o->parse_dsn();
+
+  my $password = $o->get_option('password');
+  if ($o->get_option('ask-pass')) {
+    eval {
+      require Term::ReadKey;
+      Term::ReadKey::ReadMode('noecho');
+      chomp($password = <STDIN>);
+      Term::ReadKey::ReadMode('normal');
+      print "\n"
+         or die "Cannot print: $OS_ERROR";
+    };
+    if ( $EVAL_ERROR ) {
+        die "Cannot read response; is Term::ReadKey installed? $EVAL_ERROR";
+    }
+  }
+
+  my $db = new DB(
+    host => $o->get_option('host'),
+    port => $o->get_option('port'),
+    socket => $o->get_option('socket'),
+    user => $o->get_option('user'),
+    password => $password,
+    mysql_read_default_file => $o->get_option('mysql-read-default-file')
+  );
+
+  my $cache_file = $o->get_option('cache-file');
+  my $top_tables = $o->get_option('top-tables');
+  my $force_refresh = $o->get_option('force-refresh');
+  my $engine = $o->get_option('engine');
+  my $output_json = $o->get_option('json');
+
+  my $all_rows;
+  if (-e "$cache_file" && !defined $force_refresh) {
+    if (! -r "$cache_file") {
+      die "Cannot read file '$cache_file'\n";
+    }
+
+    my $mtime = (stat("$cache_file"))[9];
+    my $current_time = time;
+
+    STDEBUG && print "mtime: $mtime, current_time: $current_time\n";
+
+    if ($current_time - $mtime < 3600) {
+      my $json = do {
+        local $/;
+        open my $fh, '<', "$cache_file"
+          or die "Cannot open file '$cache_file' for reading: $OS_ERROR\n";
+        <$fh>;
+      };
+      $all_rows = decode_json($json);
+    }
+  }
+
+  if (!defined $all_rows) {
+    my $pk_rows;
+    eval { $pk_rows = $db->{dbh}->selectall_arrayref("
+      SELECT 
+        t.TABLE_SCHEMA,
+        t.TABLE_NAME,
+        t.ENGINE,
+        SUM(pk_size) AS pk_size_bytes,
+        CONCAT(
+          '[',
+          GROUP_CONCAT(
+            CONCAT('\"', REPLACE(t.COLUMN_NAME, '\"', '\\\\\"'), ' (', t.DATA_TYPE, ')', '\"')
+          ),
+          ']'
+        ) AS pk_columns
+      FROM (
+        SELECT 
+          tc.TABLE_SCHEMA,
+          tc.TABLE_NAME,
+          t.ENGINE,
+          c.COLUMN_NAME,
+          c.DATA_TYPE,
+          (CASE 
+            WHEN c.DATA_TYPE IN ('tinyint') THEN 1
+            WHEN c.DATA_TYPE IN ('smallint') THEN 2
+            WHEN c.DATA_TYPE IN ('mediumint') THEN 3
+            WHEN c.DATA_TYPE IN ('int', 'integer') THEN 4
+            WHEN c.DATA_TYPE IN ('bigint') THEN 8
+            WHEN c.DATA_TYPE IN ('float') THEN 4
+            WHEN c.DATA_TYPE IN ('double', 'real') THEN 8
+            WHEN c.DATA_TYPE IN ('decimal', 'numeric') THEN 
+              FLOOR((c.NUMERIC_PRECISION + 2) / 9) * 4
+            WHEN c.DATA_TYPE IN ('char') THEN c.CHARACTER_MAXIMUM_LENGTH
+            WHEN c.DATA_TYPE IN ('varchar') THEN 
+              c.CHARACTER_MAXIMUM_LENGTH + 
+              CASE WHEN c.CHARACTER_MAXIMUM_LENGTH <= 255 THEN 1 ELSE 2 END
+            WHEN c.DATA_TYPE IN ('binary') THEN c.CHARACTER_MAXIMUM_LENGTH
+            WHEN c.DATA_TYPE IN ('varbinary') THEN 
+              c.CHARACTER_MAXIMUM_LENGTH + 
+              CASE WHEN c.CHARACTER_MAXIMUM_LENGTH <= 255 THEN 1 ELSE 2 END
+            WHEN c.DATA_TYPE IN ('text', 'tinytext', 'mediumtext', 'longtext') THEN 10
+            WHEN c.DATA_TYPE IN ('blob', 'tinyblob', 'mediumblob', 'longblob') THEN 10
+            WHEN c.DATA_TYPE IN ('date', 'time', 'year') THEN 3
+            WHEN c.DATA_TYPE IN ('datetime', 'timestamp') THEN 8
+            ELSE 4  -- Default for unknown types
+          END) * t.TABLE_ROWS AS pk_size
+        FROM 
+          INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+          JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+            AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+            AND tc.TABLE_NAME = kcu.TABLE_NAME
+          JOIN INFORMATION_SCHEMA.COLUMNS c
+            ON kcu.TABLE_SCHEMA = c.TABLE_SCHEMA
+            AND kcu.TABLE_NAME = c.TABLE_NAME
+            AND kcu.COLUMN_NAME = c.COLUMN_NAME
+          JOIN INFORMATION_SCHEMA.TABLES t
+            ON t.TABLE_SCHEMA = tc.TABLE_SCHEMA
+            AND t.TABLE_NAME = tc.TABLE_NAME
+        WHERE 
+          tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND
+          t.TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+      ) t
+      GROUP BY 
+        t.TABLE_SCHEMA,
+        t.TABLE_NAME,
+        t.ENGINE
+      ", { Slice => {} })
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get primary key usage info from information_schema: ${EVAL_ERROR}";
+    }
+
+    my $no_pk_rows;
+    eval { $no_pk_rows = $db->{dbh}->selectall_arrayref("
+      SELECT
+        t.TABLE_SCHEMA,
+        t.TABLE_NAME,
+        t.ENGINE,
+        t.TABLE_ROWS * 6 AS pk_size_bytes,
+        '[\"__INTERNAL_ID__ (int)\"]' AS pk_columns
+      FROM
+        INFORMATION_SCHEMA.TABLES t
+        LEFT JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+          ON t.TABLE_SCHEMA = tc.TABLE_SCHEMA
+          AND t.TABLE_NAME = tc.TABLE_NAME
+          AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+      WHERE
+        tc.CONSTRAINT_TYPE IS NULL AND
+        t.TABLE_TYPE = 'BASE TABLE' AND
+        t.TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+      ", { Slice => {} })
+    };
+    if ($EVAL_ERROR) {
+      die "Can't get primary key usage info from information_schema: ${EVAL_ERROR}";
+    }
+
+    my @merged_pk_rows = (@{$pk_rows}, @{$no_pk_rows});
+    foreach my $row (@merged_pk_rows) {
+      $row->{pk_size_bytes} = $row->{pk_size_bytes} + 0;
+      $row->{pk_columns} = decode_json($row->{pk_columns});
+    }
+
+    $all_rows = \@merged_pk_rows;
+
+    # write query result to cache file
+    sysopen(my $fh, "$cache_file", O_WRONLY|O_TRUNC|O_CREAT, 0600)
+      or die "Cannot open file '$cache_file' for writing: $OS_ERROR\n";
+    print { $fh } encode_json($all_rows)
+      or die "Cannot print to file '$cache_file': $OS_ERROR\n";
+  }
+
+  if (lc($engine) ne 'all') {
+    my @filtered_rows = grep lc($_->{ENGINE}) eq lc($engine), @{$all_rows};
+    $all_rows = \@filtered_rows;
+  }
+
+  my @sorted_rows = sort { $b->{pk_size_bytes} <=> $a->{pk_size_bytes} } @{$all_rows};
+  $all_rows = \@sorted_rows;
+
+  # calculate how many tables need to be printed out
+  my $print_limit;
+  if ("$top_tables" eq 'all') {
+    $print_limit = scalar(@{$all_rows});
+  } else {
+    $print_limit = $top_tables + 0;
+  }
+
+  my $row_index = 0;
+  my %engine_size = ();
+  foreach my $row (@{$all_rows}) {
+    if (exists $engine_size{$row->{ENGINE}}) {
+      $engine_size{$row->{ENGINE}} = $engine_size{$row->{ENGINE}} + $row->{pk_size_bytes};
+    } else {
+      $engine_size{$row->{ENGINE}} = $row->{pk_size_bytes}
+    }
+
+    if ($row_index < $print_limit && !defined $output_json) {
+      printf $hdr_fmt, ('#' x $hdr_width);
+      printf $hdr_fmt, "$row->{TABLE_SCHEMA}.$row->{TABLE_NAME}";
+      printf $hdr_fmt, ('#' x $hdr_width);
+      print "\n";
+
+      my $tb = Text::Table->new((\'| ', 'TABLE_SCHEMA', \' | ', 'TABLE_NAME', \' | ', 'ENGINE', \' | ', 'primary_key_size', \' | ', 'pk_columns', \' |'));
+      $tb->add("$row->{TABLE_SCHEMA}", "$row->{TABLE_NAME}", "$row->{ENGINE}", sprintf("%.2f", $row->{pk_size_bytes} / 1024 / 1024 / 1024) . " GB\n", join(', ', @{$row->{pk_columns}}));
+
+      print_table($tb);
+    }
+
+    $row_index++;
+  }
+
+  if (defined $output_json) {
+    my %json = (
+      by_table => $all_rows,
+      by_engine => \%engine_size,
+    );
+    print to_json(\%json, {pretty => 2});
+  } else {
+    if ($print_limit < scalar(@{$all_rows})) {
+      printf $hdr_fmt, ('#' x $hdr_width);
+      printf $hdr_fmt, (scalar(@{$all_rows}) - $print_limit) . " table(s) not shown";
+      printf $hdr_fmt, ('#' x $hdr_width);
+      print "\n";
+    }
+
+    foreach my $engine (keys %engine_size) {
+      print "Total $engine: " . sprintf("%.2f", $engine_size{$engine} / 1024 / 1024 / 1024) . " GB\n";
+    }
+  }
+
+  $db->disconnect() if $db;
+  return 0;
+}
+
+sub print_table {
+  my ( $tb ) = @_;
+
+  my $rule = $tb->rule(qw/- +/);
+  my @lines = $tb->body;
+
+  print $rule . $tb->title . $rule;
+  for (@lines) {
+    print $_ . $rule;
+  }
+
+  print "\n";
+}
+
+# ############################################################################
+# Run the program.
+# ############################################################################
+if ( !caller ) { exit main(@ARGV); }
+
+1; # Because this is a module as well as a script.
+
+# ############################################################################
+# Documentation.
+# ############################################################################
+
+__END__
+
+=head1 NAME
+
+st-pk-size - a program to compute size of primary keys for each storage engine
+of MySQL/MariaDB.
+
+=head1 SYNOPSIS
+
+Usage: st-pk-size [OPTION...] [DSN]
+
+st-pk-size computes the size of primary keys for each storage engine
+of MySQL/MariaDB.
+
+Example:
+
+  st-pk-size
+
+  st-pk-size -u mysql -h localhost
+
+  st-pk-size u=mysql,p=mysql
+
+Default credentials are read from the following files in the given order:
+/etc/my.cnf /etc/mysql/my.cnf /usr/etc/my.cnf ~/.my.cnf
+
+=head1 DESCRIPTION
+
+st-prioritizer fetches table meta data from INFORMATION_SCHEMA, and computes
+size of primary keys for each storage engine.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--top-tables>
+
+type: integer | all; default: 20
+
+Only show top tables by this size. Not applied when --json is specified.
+If = 0, only show totals. If = all show all tables.
+
+=item B<--force-refresh>
+
+type: boolean; default: false
+
+Force to refresh cache.
+
+=item B<--cache-file>
+
+type: string; default: /tmp/.st-pk-size.cache
+
+Cache file path.
+
+=item B<--engine>
+
+type: string; default: all
+
+Only compute for this storage engine.
+
+=item B<--json>
+
+type: boolean; default: false
+
+Output result in JSON format.
+
+=item B<--user>
+
+short form: -u; type: string
+
+User for login if not current user.
+
+=item B<--password>
+
+short form: -p; type: string
+
+Password to use when connecting.
+
+=item B<--host>
+
+short form: -h; type: string
+
+Server to connect to.
+
+=item B<--socket>
+
+short form: -S; type: string
+
+The socket file to use for connection.
+
+=item B<--port>
+
+short form: -P; type: integer
+
+Server listen port.
+
+=item B<--mysql-read-default-file>
+
+short form: -F; type: string
+
+Only read mysql options from the given file.
+
+=item B<--ask-pass>
+
+type: boolean; default: false
+
+Prompt for a password when connecting to MySQL.
+
+=item B<--mysql-cli>
+
+default: mysql
+
+Name/Path of mysql cli.
+
+=item B<--help>
+
+Print a brief help message and exits.
+
+=item B<--version>
+
+Show version and exit.
+
+=back
+
+=head1 DSN OPTIONS
+
+These DSN options are used to create a DSN.  Each option is given like
+C<option=value>.  The options are case-sensitive, so P and p are not the
+same option.  There cannot be whitespace before or after the C<=> and
+if the value contains whitespace it must be quoted.  DSN options are
+comma-separated.
+
+=over
+
+=item * F
+
+Only read default options from the given file
+
+=item * h
+
+Connect to host.
+
+=item * p
+
+Password to use when connecting.
+If password contains commas they must be escaped with a backslash: "exam\,ple"
+
+=item * P
+
+Port number to use for connection.
+
+=item * S
+
+Socket file to use for connection.
+
+=item * u
+
+User for login if not current user.
+
+=cut
