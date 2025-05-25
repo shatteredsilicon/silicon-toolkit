@@ -163,7 +163,22 @@ sub parse_dsn {
     return;
   }
 
-  # can't get default socket patch, use
+  # check default socket paths
+  my @socket_files = (
+    '/var/lib/mysql/mysql.sock',
+    '/var/run/mysqld/mysqld.sock',
+    '/run/mysqld/mysqld.sock',
+    '/tmp/mysql.sock'
+  );
+  foreach my $socket_file (@socket_files) {
+    if (! -e "$socket_file") {
+      next;
+    }
+
+    $self->{args}->{socket} = "$socket_file";
+  }
+
+  # can't get default socket path, use
   # default host 'localhost'
   if (!defined $self->{args}->{socket}) {
     $self->{args}->{host} = 'localhost';

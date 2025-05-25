@@ -51,7 +51,6 @@ sub new {
     "tables|t=s" => \my @tables,
     "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
     "ask-pass" => \my $ask_password,
-    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "threshold=i" => \(my $threshold = 80),
     "schema=s" => \my $schema,
     "verbose" => \my $verbose,
@@ -179,18 +178,19 @@ sub parse_dsn {
     return;
   }
 
-  # read default socket path from output of
-  # 'mysql --print-defaults'
-  my $mysqlbinlog_cli = $self->get_option('mysql-cli');
-  open FH, "${mysqlbinlog_cli} --print-defaults |";
-	my @lines = <FH>;
-	close FH;
-
-  foreach my $line (@lines) {
-    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
-      $self->{args}->{socket} = "$path";
-      last;
+  # check default socket paths
+  my @socket_files = (
+    '/var/lib/mysql/mysql.sock',
+    '/var/run/mysqld/mysqld.sock',
+    '/run/mysqld/mysqld.sock',
+    '/tmp/mysql.sock'
+  );
+  foreach my $socket_file (@socket_files) {
+    if (! -e "$socket_file") {
+      next;
     }
+
+    $self->{args}->{socket} = "$socket_file";
   }
 
   # can't get default socket patch, use
@@ -636,12 +636,6 @@ Server listen port.
 type: boolean
 
 Prompt for a password when connecting to MySQL.
-
-=item B<--mysql-cli>
-
-default: mysql
-
-Name/Path of mysql cli.
 
 =item B<--verbose>
 

@@ -48,7 +48,6 @@ sub new {
     "port|P=i" => \(my $port = 3306),
     "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
     "ask-pass" => \my $ask_password,
-    "mysql-cli=s" => \(my $mysql_cli = 'mysql'),
     "interval|i=i" => \(my $interval = 60),
     "threshold|t=i" => \(my $threshold = 60),
     "progressive|r" => \my $progressive,
@@ -174,21 +173,22 @@ sub parse_dsn {
     return;
   }
 
-  # read default socket path from output of
-  # 'mysql --print-defaults'
-  my $mysqlbinlog_cli = $self->get_option('mysql-cli');
-  open FH, "${mysqlbinlog_cli} --print-defaults |";
-	my @lines = <FH>;
-	close FH;
-
-  foreach my $line (@lines) {
-    if (my ( $path ) = $line =~ m/--socket=(\S+)/) {
-      $self->{args}->{socket} = "$path";
-      last;
+  # check default socket paths
+  my @socket_files = (
+    '/var/lib/mysql/mysql.sock',
+    '/var/run/mysqld/mysqld.sock',
+    '/run/mysqld/mysqld.sock',
+    '/tmp/mysql.sock'
+  );
+  foreach my $socket_file (@socket_files) {
+    if (! -e "$socket_file") {
+      next;
     }
+
+    $self->{args}->{socket} = "$socket_file";
   }
 
-  # can't get default socket patch, use
+  # can't get default socket path, use
   # default host 'localhost'
   if (!defined $self->{args}->{socket}) {
     $self->{args}->{host} = 'localhost';
@@ -648,12 +648,6 @@ Only read mysql options from the given file.
 type: boolean; default: false
 
 Prompt for a password when connecting to MySQL.
-
-=item B<--mysql-cli>
-
-default: mysql
-
-Name/Path of mysql cli.
 
 =item B<--pid-file>
 
