@@ -371,14 +371,6 @@ my %fixed_length_data_types = (
   "UUID"        => '$M'
 );
 
-my %string_data_types = (
-  '^.*(BLOB|TEXT)$' => 40,
-  '^.*(CHAR|BINARY)$' => 255,
-  '^INET4$' => undef,
-  '^INET6$' => undef,
-  '^UUID$' => undef,
-);
-
 my @table_titles = (\'| ', 'Column Name', \' | ', 'Type', \' | ', 'Min Size', \' | ', 'Max Size', \' |');
 
 # variables from innodb
@@ -654,17 +646,17 @@ sub main {
 }
 
 sub set_column_size {
-  my ( $db, $column, $is_compact ) = @_;
+  my ( $db, $column, $is_compact, $is_dynamic ) = @_;
   my $M = $column->{data_type} eq "ENUM"
             ? (($column->{column_type} =~ s/(\'.*?\'(?!\')(?=,|$))/$1/g) || 0) + 1
-            : (grep { "$column->{'data_type'}" =~ m/$_/ } (keys %string_data_types))
-                ? $column->{character_octet_length}
-                : ($column->{character_maximum_length} || $column->{numeric_precision} || $column->{datetime_precision} || 0);
+            : ($column->{character_octet_length} || $column->{character_maximum_length} || $column->{numeric_precision} || $column->{datetime_precision} || 0);
   my $D = $column->{numeric_scale} || 0;
 
   my $max_value;
   my $is_fixed_length = 0;
-  if (exists $fixed_length_data_types{$column->{data_type}}) {
+  if ($is_dynamic && "$column->{'data_type'}" =~ m/^.*(BLOB|TEXT)$/) {
+    $max_value = 40;
+  } elsif (exists $fixed_length_data_types{$column->{data_type}}) {
     $max_value = eval($fixed_length_data_types{$column->{data_type}});
     $is_fixed_length = 1;
   } else {
@@ -691,11 +683,8 @@ sub set_column_size {
     } else {
       $min_value = $max_value;
     }
-  } elsif (!$is_compact && defined $column->{character_maximum_length} && defined $column->{character_octet_length}) {
-    # For string-like data types and it's non-null, at least 1 character
-    $min_value = int($column->{character_maximum_length} / $column->{character_octet_length});
   } else {
-    $min_value = 1;
+    $min_value = 0;
   }
 
   my @sizes = ($min_value, $max_value);
@@ -716,7 +705,7 @@ sub redundant_row_sizes {
   my $max_columns_size = (sum map { $_->{sizes}->[1] } @{$columns}) + $common_columns_size;
   my $column_count = (scalar @{$columns}) + (defined $has_primary_key && $has_primary_key ? 2 : 3);
   my $min_record_directory_size = $column_count * ( $min_columns_size < 128 ? 1 : 2 );
-  my $max_record_directory_size = $column_count *( $max_columns_size < 128 ? 1 : 2 );
+  my $max_record_directory_size = $column_count * ( $max_columns_size < 128 ? 1 : 2 );
 
   my $min_row_size = $REC_N_OLD_EXTRA_BYTES + $min_record_directory_size + $min_columns_size;
   my $max_row_size = $REC_N_OLD_EXTRA_BYTES + $max_record_directory_size + $max_columns_size;
@@ -827,10 +816,10 @@ sub compressed_row_limt {
     ;
 }
 
-sub fit_column_size {
+sub set_dynamic_column_size {
   my ( $db, $columns, $limit_size, $has_primary_key, $is_compressed ) = @_;
 
-  foreach my $column (@{$columns}) { set_column_size($db, $column, 1); }
+  foreach my $column (@{$columns}) { set_column_size($db, $column, 1, 1); }
   my @sorted_columns = sort { ${b}->{column}->{sizes}[1] > ${a}->{column}->{sizes}[1] } ( map({ column => $_ }, @{$columns}) );
   my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key, $is_compressed);
   foreach my $sorted_column (@sorted_columns) {
@@ -847,7 +836,7 @@ sub fit_column_size {
       $sorted_column->{column}->{sizes}->[0] = $sorted_column->{column}->{sizes}->[1];
     }
 
-    $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key);
+    $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key, $is_compressed);
   }
 }
 
@@ -856,7 +845,7 @@ sub redundant_size {
 
   my $tb = Text::Table->new(@table_titles);
   foreach my $column (@{$columns}) {
-    set_column_size($db, $column, 0);
+    set_column_size($db, $column, 0, 0);
     $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
   }
   my $row_sizes = redundant_row_sizes($db, $columns, $has_primary_key);
@@ -872,7 +861,7 @@ sub compact_size {
 
   my $tb = Text::Table->new(@table_titles);
   foreach my $column (@{$columns}) {
-    set_column_size($db, $column, 1);
+    set_column_size($db, $column, 1, 0);
     $tb->add("$column->{column_name}", "$column->{column_type}", $column->{sizes}->[0], $column->{sizes}->[1]);
   }
   my $row_sizes = compact_family_row_sizes($db, $columns, $has_primary_key);
@@ -887,7 +876,7 @@ sub dynamic_size {
   my ( $db, $columns, $innodb_page_size, $has_primary_key ) = @_;
 
   my $row_limit = compact_family_row_limit($db, $innodb_page_size);
-  fit_column_size($db, $columns, $row_limit, $has_primary_key);
+  set_dynamic_column_size($db, $columns, $row_limit, $has_primary_key);
 
   my $tb = Text::Table->new(@table_titles);
   foreach my $column (@{$columns}) {
@@ -912,7 +901,7 @@ sub compressed_size {
   }
 
   my $row_limit = compressed_row_limt($db, $columns, $file_block_size, $has_primary_key);
-  fit_column_size($db, $columns, $row_limit, $has_primary_key, 1);
+  set_dynamic_column_size($db, $columns, $row_limit, $has_primary_key, 1);
 
   my $tb = Text::Table->new(@table_titles);
   foreach my $column (@{$columns}) {
