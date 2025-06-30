@@ -9,7 +9,26 @@ Vendor:         Shattered Silicon Ltd
 URL:            https://shatteredsilicon.net
 Source0:        %{name}-%{version}-%{release}.tar.gz
 
-Requires: perl-DBI, perl-DBD-MySQL
+# Build dependencies
+BuildRequires:  perl
+BuildRequires:  systemd
+
+# These packages only exist on RHEL/OL 8 and later
+%if 0%{?rhel} >= 8
+BuildRequires:  perl-generators
+BuildRequires:  systemd-rpm-macros
+%endif
+
+# Required Perl modules
+Requires: perl
+Requires: perl(Capture::Tiny)
+Requires: perl(Config::IniFiles)
+Requires: perl(DBD::mysql)
+Requires: perl(JSON)
+Requires: perl(Number::Bytes::Human)
+Requires: perl(Parallel::ForkManager)
+Requires: perl(Proc::Pidfile)
+Requires: perl(Text::Table)
 
 Requires(post):     systemd
 Requires(preun):    systemd
