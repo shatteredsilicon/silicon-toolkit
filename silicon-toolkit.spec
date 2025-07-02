@@ -53,10 +53,10 @@ visit https://github.com/shatteredsilicon.
 %setup -q -n %{name}
 
 %install
-install -m 0755 -d $RPM_BUILD_ROOT/usr/bin
-install -m 0755 -d $RPM_BUILD_ROOT/lib/systemd/system
-install -m 0755 bin/* $RPM_BUILD_ROOT/usr/bin/
-install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
+install -d -m 0755 %{buildroot}%{_bindir}
+install -d -m 0755 %{buildroot}%{_unitdir}
+install -m 0755 bin/* %{buildroot}%{_bindir}/
+install -m 0644 config/systemd/*.service %{buildroot}%{_unitdir}/
 
 %post
 %systemd_post st-sideload-relay.service
@@ -74,5 +74,5 @@ install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
 rm -rf $RPM_BUILD_ROOT
 
 %files
-/usr/bin/*
-%config /lib/systemd/system/*
+%{_bindir}/*
+%config %{_unitdir}/*.service
