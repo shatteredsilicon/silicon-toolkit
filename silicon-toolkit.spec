@@ -9,7 +9,26 @@ Vendor:         Shattered Silicon Ltd
 URL:            https://shatteredsilicon.net
 Source0:        %{name}-%{version}-%{release}.tar.gz
 
-Requires: perl-DBI, perl-DBD-MySQL
+# Build dependencies
+BuildRequires:  perl
+BuildRequires:  systemd
+
+# These packages only exist on RHEL/OL 8 and later
+%if 0%{?rhel} >= 8
+BuildRequires:  perl-generators
+BuildRequires:  systemd-rpm-macros
+%endif
+
+# Required Perl modules
+Requires: perl
+Requires: perl(Capture::Tiny)
+Requires: perl(Config::IniFiles)
+Requires: perl(DBD::mysql)
+Requires: perl(JSON)
+Requires: perl(Number::Bytes::Human)
+Requires: perl(Parallel::ForkManager)
+Requires: perl(Proc::Pidfile)
+Requires: perl(Text::Table)
 
 Requires(post):     systemd
 Requires(preun):    systemd
@@ -34,10 +53,10 @@ visit https://github.com/shatteredsilicon.
 %setup -q -n %{name}
 
 %install
-install -m 0755 -d $RPM_BUILD_ROOT/usr/bin
-install -m 0755 -d $RPM_BUILD_ROOT/lib/systemd/system
-install -m 0755 bin/* $RPM_BUILD_ROOT/usr/bin/
-install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
+install -d -m 0755 %{buildroot}%{_bindir}
+install -d -m 0755 %{buildroot}%{_unitdir}
+install -m 0755 bin/* %{buildroot}%{_bindir}/
+install -m 0644 config/systemd/*.service %{buildroot}%{_unitdir}/
 
 %post
 %systemd_post st-sideload-relay.service
@@ -55,5 +74,5 @@ install -m 0644 config/systemd/*.service $RPM_BUILD_ROOT/lib/systemd/system/
 rm -rf $RPM_BUILD_ROOT
 
 %files
-/usr/bin/*
-%config /lib/systemd/system/*
+%{_bindir}/*
+%config %{_unitdir}/*.service
