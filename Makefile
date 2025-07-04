@@ -11,16 +11,13 @@ all: sdeb deb
 else
 ARCH	:= $(shell rpm --eval "%{_arch}")
 all: srpm rpm
-DEPENDENCY_MODULES := $(shell sed -rz 's/.*(modules=\(.*\)).*/\1/' dependency/rpmbuild/SOURCES/prep_sources.sh)
 endif
 
 TARBALL_FILE	:= $(BUILDDIR)/tarballs/silicon-toolkit-$(VERSION)-$(RELEASE).tar.gz
-SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE).src.rpm $(shell declare -A $(DEPENDENCY_MODULES); for module in $${!modules[@]}; do echo $(BUILDDIR)/results/SRPMS/perl-$${module}-$$(rpmspec -q --queryformat='%{version}-%{release}' --define 'dist %{nil}' dependency/rpmbuild/SPECS/perl-$${module}.spec).src.rpm; done)
-RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm $(shell declare -A $(DEPENDENCY_MODULES); for module in $${!modules[@]}; do echo $(BUILDDIR)/results/RPMS/perl-$${module}-$$(rpmspec -q --queryformat='%{version}-%{release}' --define 'dist %{nil}' dependency/rpmbuild/SPECS/perl-$${module}.spec).noarch.rpm; done)
+SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE).src.rpm $(BUILDDIR)/results/SRPMS/perl-Capture-Tiny-0.50-1.src.rpm $(BUILDDIR)/results/SRPMS/perl-Proc-Pidfile-1.10-1.src.rpm 
+RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm $(BUILDDIR)/results/RPMS/perl-Capture-Tiny-0.50-1.noarch.rpm $(BUILDDIR)/results/RPMS/perl-Proc-Pidfile-1.10-1.noarch.rpm
 SDEB_FILES		:= $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).dsc $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).tar.gz
 DEB_FILES		:= $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).deb $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).changes
-
-DEPENDENCY_TARBALL_FILES := $(shell declare -A $(DEPENDENCY_MODULES); for module in $${!modules[@]}; do echo $(BUILDDIR)/tarballs/$${module}-$${modules[$$module]%%|*}.tar.gz; done)
 
 $(TARBALL_FILE):
 	mkdir -vp $(shell dirname $(TARBALL_FILE))
@@ -30,32 +27,26 @@ $(TARBALL_FILE):
 .PHONY: srpm
 srpm: $(SRPM_FILE)
 
-$(DEPENDENCY_TARBALL_FILES):
-	cd $(BUILDDIR)/tarballs && source $(CURDIR)/dependency/rpmbuild/SOURCES/prep_sources.sh
-
-$(SRPM_FILE): $(TARBALL_FILE) $(DEPENDENCY_TARBALL_FILES)
+$(SRPM_FILE):
 	mkdir -vp $(BUILDDIR)/rpmbuild/{SOURCES,SPECS,BUILD,SRPMS,RPMS}
 	mkdir -vp $(shell dirname $(SRPM_FILE))
 
 	# prepare and build silicon-toolkit
+	tar --exclude-vcs -czf $(BUILDDIR)/rpmbuild/SOURCES/$(shell basename $(TARBALL_FILE)) -C $(shell dirname $(CURDIR)) --transform s/^$(shell basename $(CURDIR))/silicon-toolkit/ $(shell basename $(CURDIR))
 	cp silicon-toolkit.spec $(BUILDDIR)/rpmbuild/SPECS/silicon-toolkit.spec
 	sed -i "s/%{_version}/$(VERSION)/g" "$(BUILDDIR)/rpmbuild/SPECS/silicon-toolkit.spec"
 	sed -i "s/%{_release}/$(RELEASE)/g" "$(BUILDDIR)/rpmbuild/SPECS/silicon-toolkit.spec"
-	cp $(TARBALL_FILE) $(BUILDDIR)/rpmbuild/SOURCES/
 	spectool -C $(BUILDDIR)/rpmbuild/SOURCES/ -g $(BUILDDIR)/rpmbuild/SPECS/silicon-toolkit.spec
 	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" $(BUILDDIR)/rpmbuild/SPECS/silicon-toolkit.spec
 
 	# prepare and build dependencies
-	for tarball in $(DEPENDENCY_TARBALL_FILES); do \
-		cp $${tarball} $(BUILDDIR)/rpmbuild/SOURCES/; \
-	done
-
-	declare -A $(DEPENDENCY_MODULES) && \
-	for module in $${!modules[@]}; do \
-		cp "dependency/rpmbuild/SPECS/perl-$${module}.spec" $(BUILDDIR)/rpmbuild/SPECS/ && \
-		sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' "$(BUILDDIR)/rpmbuild/SPECS/perl-$${module}.spec" && \
-		rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" --define 'dist %{nil}' "$(BUILDDIR)/rpmbuild/SPECS/perl-$${module}.spec"; \
-	done
+	cd $(BUILDDIR)/rpmbuild/SOURCES && source $(CURDIR)/dependency/rpmbuild/SOURCES/prep_sources.sh
+	cp dependency/rpmbuild/SPECS/perl-Capture-Tiny.spec $(BUILDDIR)/rpmbuild/SPECS/
+	cp dependency/rpmbuild/SPECS/perl-Proc-Pidfile.spec $(BUILDDIR)/rpmbuild/SPECS/
+	sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' $(BUILDDIR)/rpmbuild/SPECS/perl-Capture-Tiny.spec
+	sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' $(BUILDDIR)/rpmbuild/SPECS/perl-Proc-Pidfile.spec
+	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" --define 'dist %{nil}' $(BUILDDIR)/rpmbuild/SPECS/perl-Capture-Tiny.spec
+	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" --define 'dist %{nil}' $(BUILDDIR)/rpmbuild/SPECS/perl-Proc-Pidfile.spec
 
 	for srpm_file in $(SRPM_FILE); do \
 		mv $(BUILDDIR)/rpmbuild/SRPMS/$$(basename $${srpm_file}) $${srpm_file}; \
