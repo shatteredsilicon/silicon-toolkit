@@ -55,6 +55,7 @@ sub new {
     "schema=s" => \my $schema,
     "verbose" => \my $verbose,
     "parallel=i" => \(my $parallel = 1),
+    "fast-auto-increment-only|fast" => \my $fast,
     "help" => \my $help
   );
   GetOptions(
@@ -389,6 +390,7 @@ sub main {
   my $threshold = $o->get_option('threshold');
   my $verbose = $o->get_option('verbose');
   my $parallel = $o->get_option('parallel');
+  my $fast = $o->get_option('fast-auto-increment-only');
 
   my $pm = Parallel::ForkManager->new($parallel);
 
@@ -412,7 +414,7 @@ sub main {
         $dbh = $db->{dbh};
       }
 
-      check_int_columns($dbh, $sm, $tbl, $threshold, $verbose);
+      check_int_columns($dbh, $sm, $tbl, $threshold, $fast, $verbose);
 
       if ($parallel > 1) {
         $pm->finish;
@@ -460,7 +462,7 @@ sub main {
           $dbh = $db->{dbh};
         }
 
-        check_int_columns($dbh, $sm, $table, $threshold, $verbose);
+        check_int_columns($dbh, $sm, $table, $threshold, $fast, $verbose);
 
         if ($parallel > 1) {
           $pm->finish;
@@ -475,10 +477,20 @@ sub main {
 }
 
 sub check_int_columns {
-  my ( $dbh, $schema, $table, $threshold, $verbose ) = @_;
+  my ( $dbh, $schema, $table, $threshold, $fast, $verbose ) = @_;
+
+  my $columns_sql;
+  if ($fast) {
+    $columns_sql = "SELECT c.COLUMN_NAME, IF(c.COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED"
+                  . " FROM information_schema.COLUMNS c"
+                  . " JOIN information_schema.KEY_COLUMN_USAGE kcu ON c.TABLE_SCHEMA = kcu.TABLE_SCHEMA AND c.TABLE_NAME = kcu.TABLE_NAME AND c.COLUMN_NAME = kcu.COLUMN_NAME"
+                  . " WHERE c.TABLE_SCHEMA = " . $dbh->quote("$schema") . " AND c.TABLE_NAME = " . $dbh->quote("$table") . " AND c.COLUMN_TYPE LIKE 'int\%' AND c.COLUMN_KEY = 'PRI' AND c.EXTRA LIKE '\%auto_increment\%' AND kcu.ORDINAL_POSITION = 1";
+  } else {
+    $columns_sql = "SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $dbh->quote("$schema") . " AND TABLE_NAME = " . $dbh->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'";
+  }
 
   my @columns = ();
-  eval { @columns = @{$dbh->selectall_arrayref("SELECT COLUMN_NAME, IF(COLUMN_TYPE LIKE '\%unsigned', 1, 0) as IS_UNSIGNED FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " . $dbh->quote("$schema") . " AND TABLE_NAME = " . $dbh->quote("$table") . " AND COLUMN_TYPE LIKE 'int\%'")} };
+  eval { @columns = @{$dbh->selectall_arrayref($columns_sql)} };
   if ($EVAL_ERROR) {
     print "Can't get column list of table `${schema}`.`${table}`: ${EVAL_ERROR}\n";
     return;
@@ -600,6 +612,12 @@ Only show the column that its maximum value exceeds this threshold (percent)
 type: parallel; default: 1
 
 Run the check progress in parallel
+
+=item B<--fast-auto-increment-only|--fast>
+
+type: boolean
+
+Check only the PRI auto-increment integer columns
 
 =item B<--user>
 
