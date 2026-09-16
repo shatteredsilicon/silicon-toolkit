@@ -54,7 +54,7 @@ sub new {
     "one-shot|1" => \my $one_shot,
     "reset-on-exit" => \my $reset_on_exit,
     "prioritize-replication:s" => \my $prioritize_replication,
-    "pid-file=s" => \(my $pid_file = '/run/st-prioritizer.pid'),
+    "pid-file=s" => \(my $pid_file = '/var/run/st-prioritizer.pid'),
     "help" => \my $help
   );
   GetOptions(
@@ -408,7 +408,7 @@ sub main {
   }
 
   my $thread_os_id_exists;
-  eval { $thread_os_id_exists = $db->{dbh}->selectrow_arrayref("SELECT 1 FROM information_schema.columns WHERE table_schema = 'performance_schema' AND table_name = 'threads' AND column_name = 'THREAD_OS_ID'")->[0] };
+  eval { $thread_os_id_exists = $db->{dbh}->selectrow_hashref("SELECT 1 FROM information_schema.columns WHERE table_schema = 'performance_schema' AND table_name = 'threads' AND column_name = 'THREAD_OS_ID'") };
   if ($EVAL_ERROR) {
     die "Can't check whether THREAD_OS_ID column exists: ${EVAL_ERROR}";
   }
@@ -651,7 +651,7 @@ Prompt for a password when connecting to MySQL.
 
 =item B<--pid-file>
 
-type: string; default: /run/st-prioritizer.pid
+type: string; default: /var/run/st-prioritizer.pid
 
 Pid file.
 

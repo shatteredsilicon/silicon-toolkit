@@ -3,21 +3,13 @@
 Name:           silicon-toolkit
 Summary:        Shattered Silicon Toolkit
 Version:        %{_version}
-Release:        %{_release}
+Release:        %{_release}%{?dist}
 License:        GPL-2.0
 Vendor:         Shattered Silicon Ltd
 URL:            https://shatteredsilicon.net
-Source0:        %{name}-%{version}-%{release}.tar.gz
+Source0:        %{name}-%{version}-%{_release}.tar.gz
 
-# Build dependencies
-BuildRequires:  perl
-BuildRequires:  systemd
-
-# These packages only exist on RHEL/OL 8 and later
-%if 0%{?rhel} >= 8
-BuildRequires:  perl-generators
-BuildRequires:  systemd-rpm-macros
-%endif
+Requires: initscripts, chkconfig
 
 # Required Perl modules
 Requires: perl
@@ -29,10 +21,6 @@ Requires: perl(Number::Bytes::Human)
 Requires: perl(Parallel::ForkManager)
 Requires: perl(Proc::Pidfile)
 Requires: perl(Text::Table)
-
-Requires(post):     systemd
-Requires(preun):    systemd
-Requires(postun):   systemd
 
 %description
 Silicon Toolkit is a collection of advanced command-line tools used by
@@ -54,25 +42,31 @@ visit https://github.com/shatteredsilicon.
 
 %install
 install -d -m 0755 %{buildroot}%{_bindir}
-install -d -m 0755 %{buildroot}%{_unitdir}
+install -m 0755 -d $RPM_BUILD_ROOT/etc/init.d/
 install -m 0755 bin/* %{buildroot}%{_bindir}/
-install -m 0644 config/systemd/*.service %{buildroot}%{_unitdir}/
+install -m 0755 config/init.d/* $RPM_BUILD_ROOT/etc/init.d/
 
 %post
-%systemd_post st-sideload-relay.service
-%systemd_post st-prioritizer.service
+for service in st-{prioritizer,sideload-relay}; do
+    /sbin/chkconfig --add "$service" || :
+done
 
 %preun
-%systemd_preun st-sideload-relay.service
-%systemd_preun st-prioritizer.service
+# uninstall
+if [ "$1" = "0" ]; then
+    for service in st-{prioritizer,sideload-relay}; do
+        /sbin/service "$service" stop || :
+        /sbin/chkconfig --del "service" || :
+    done
+fi
 
 %postun
-%systemd_postun st-sideload-relay.service
-%systemd_postun st-prioritizer.service
+
 
 %clean
 rm -rf $RPM_BUILD_ROOT
 
 %files
 %{_bindir}/*
-%config %{_unitdir}/*.service
+%config /etc/init.d/st-prioritizer
+%config /etc/init.d/st-sideload-relay

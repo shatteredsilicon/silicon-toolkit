@@ -542,16 +542,24 @@ sub main {
     die "Can't get table rows: ${EVAL_ERROR}";
   }
 
-  my $default_row_format;
-  eval { $default_row_format = $db->{dbh}->selectrow_arrayref('SELECT UPPER(@@innodb_default_row_format)')->[0] };
+  my $default_row_format = 'COMPACT';
+  my $innodb_default_row_format;
+  eval { $innodb_default_row_format = $db->{dbh}->selectrow_hashref('SHOW VARIABLES LIKE \'innodb_default_row_format\'') };
   if ($EVAL_ERROR) {
     die "Can't get default innodb row format: ${EVAL_ERROR}";
   }
+  if ($innodb_default_row_format) {
+    $default_row_format = uc(($innodb_default_row_format->{Value} || $innodb_default_row_format->{value}));
+  }
 
-  my $innodb_page_size;
-  eval { $innodb_page_size = $db->{dbh}->selectrow_arrayref('SELECT @@innodb_page_size')->[0] };
-  if ( $EVAL_ERROR ) {
-      die "Can't get innodb page size: $EVAL_ERROR";
+  my $innodb_page_size = 16 * 1024; # 16 KiB
+  my $innodb_page_size_var;
+  eval { $innodb_page_size_var = $db->{dbh}->selectrow_hashref('SHOW VARIABLES LIKE \'innodb_page_size\'') };
+  if ($EVAL_ERROR) {
+    die "Can't get innodb page size: $EVAL_ERROR";
+  }
+  if ($innodb_page_size_var) {
+    $innodb_page_size = $innodb_page_size_var->{Value} || $innodb_page_size_var->{value};
   }
 
   foreach my $table_row (@{$table_rows}) {
@@ -570,12 +578,11 @@ sub main {
     my $column_rows;
     eval {
       $column_rows = $db->{dbh}->selectall_arrayref("
-        SELECT  UPPER(data_type) AS data_type,
+        SELECT  *, UPPER(data_type) AS data_type,
                 CHARACTER_MAXIMUM_LENGTH AS character_maximum_length,
                 CHARACTER_OCTET_LENGTH AS character_octet_length,
                 NUMERIC_PRECISION AS numeric_precision,
                 NUMERIC_SCALE AS numeric_scale,
-                DATETIME_PRECISION AS datetime_precision,
                 COLUMN_NAME AS column_name,
                 COLUMN_KEY AS column_key,
                 COLUMN_TYPE AS column_type,
@@ -649,7 +656,7 @@ sub set_column_size {
   my ( $db, $column, $is_compact, $is_dynamic ) = @_;
   my $M = $column->{data_type} eq "ENUM"
             ? (($column->{column_type} =~ s/(\'.*?\'(?!\')(?=,|$))/$1/g) || 0) + 1
-            : ($column->{character_octet_length} || $column->{character_maximum_length} || $column->{numeric_precision} || $column->{datetime_precision} || 0);
+            : ($column->{character_octet_length} || $column->{character_maximum_length} || $column->{numeric_precision} || $column->{DATETIME_PRECISION} || 0);
   my $D = $column->{numeric_scale} || 0;
 
   my $max_value;

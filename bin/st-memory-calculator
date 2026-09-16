@@ -415,7 +415,10 @@ sub main {
     eval { $values = $db->{dbh}->selectrow_arrayref($per_connection_allocations{$key}) };
     if ($EVAL_ERROR) {
       $db->disconnect() if $db;
-      die "Can't get value with '$per_connection_allocations{$key}' for global variable '${key}'";
+      if (index(lc($EVAL_ERROR), lc('Unknown system variable'))) {
+        die "This tool isn't available because some system variables are missing in current version of MySQL";
+      }
+      die "Can't get value with '$per_connection_allocations{$key}' for global variable '${key}': $EVAL_ERROR";
     }
 
     $per_connection_allocations_table->add("$key", "$values->[0]", "$values->[1]");
@@ -427,7 +430,10 @@ sub main {
     eval { $values = $db->{dbh}->selectrow_arrayref($per_replication_thread_allocations{$key}) };
     if ($EVAL_ERROR) {
       $db->disconnect() if $db;
-      die "Can't get value with '$per_replication_thread_allocations{$key}' for global variable '${key}'";
+      if (index(lc($EVAL_ERROR), lc('Unknown system variable'))) {
+        die "This tool isn't available because some system variables are missing in current version of MySQL";
+      }
+      die "Can't get value with '$per_replication_thread_allocations{$key}' for global variable '${key}': $EVAL_ERROR";
     }
 
     $per_replication_thread_allocations_table->add("$key", "$values->[0]", "$values->[1]");
@@ -439,7 +445,10 @@ sub main {
     eval { $values = $db->{dbh}->selectrow_arrayref($global_allocations{$key}) };
     if ($EVAL_ERROR) {
       $db->disconnect() if $db;
-      die "Can't get value with '$global_allocations{$key}' for global variable '${key}'";
+      if (index(lc($EVAL_ERROR), lc('Unknown system variable'))) {
+        die "This tool isn't available because some system variables are missing in current version of MySQL";
+      }
+      die "Can't get value with '$global_allocations{$key}' for global variable '${key}': $EVAL_ERROR";
     }
 
     $global_allocations_table->add("$key", "$values->[0]");

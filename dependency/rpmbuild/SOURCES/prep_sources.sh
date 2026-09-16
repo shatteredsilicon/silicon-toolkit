@@ -5,6 +5,8 @@ set -euo pipefail
 declare -A modules=(
   [Proc-Pidfile]="1.10|N/NE/NEILB"
   [Capture-Tiny]="0.50|D/DA/DAGOLDEN"
+  [Text-Table]="1.135|S/SH/SHLOMIF"
+  [Text-Aligner]="0.08|S/SH/SHLOMIF"
 )
 
 # Loop through and handle each module

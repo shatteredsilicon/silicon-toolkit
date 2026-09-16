@@ -1,5 +1,5 @@
 BUILDDIR	?= /tmp/ssmbuild
-VERSION		?=
+VERSION		?= 1.5
 RELEASE		?= 1
 
 .PHONY: all
@@ -14,8 +14,8 @@ all: srpm rpm
 endif
 
 TARBALL_FILE	:= $(BUILDDIR)/tarballs/silicon-toolkit-$(VERSION)-$(RELEASE).tar.gz
-SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE).src.rpm $(BUILDDIR)/results/SRPMS/perl-Capture-Tiny-0.50-1.src.rpm $(BUILDDIR)/results/SRPMS/perl-Proc-Pidfile-1.10-1.src.rpm 
-RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE).$(ARCH).rpm $(BUILDDIR)/results/RPMS/perl-Capture-Tiny-0.50-1.noarch.rpm $(BUILDDIR)/results/RPMS/perl-Proc-Pidfile-1.10-1.noarch.rpm
+SRPM_FILE		:= $(BUILDDIR)/results/SRPMS/silicon-toolkit-$(VERSION)-$(RELEASE)$(shell rpm --eval "%{?dist}").src.rpm $(BUILDDIR)/results/SRPMS/perl-Capture-Tiny-0.50-1$(shell rpm --eval "%{?dist}").src.rpm $(BUILDDIR)/results/SRPMS/perl-Proc-Pidfile-1.10-1$(shell rpm --eval "%{?dist}").src.rpm $(BUILDDIR)/results/SRPMS/perl-Text-Table+Aligner-1.135-1$(shell rpm --eval "%{?dist}").src.rpm
+RPM_FILES		:= $(BUILDDIR)/results/RPMS/silicon-toolkit-$(VERSION)-$(RELEASE)$(shell rpm --eval "%{?dist}").$(ARCH).rpm $(BUILDDIR)/results/RPMS/perl-Capture-Tiny-0.50-1$(shell rpm --eval "%{?dist}").noarch.rpm $(BUILDDIR)/results/RPMS/perl-Proc-Pidfile-1.10-1$(shell rpm --eval "%{?dist}").noarch.rpm $(BUILDDIR)/results/RPMS/perl-Text-Table+Aligner-1.135-1$(shell rpm --eval "%{?dist}").noarch.rpm
 SDEB_FILES		:= $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).dsc $(BUILDDIR)/results/SDEBS/silicon-toolkit_$(VERSION)-$(RELEASE).tar.gz
 DEB_FILES		:= $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).deb $(BUILDDIR)/results/DEBS/silicon-toolkit_$(VERSION)-$(RELEASE)_$(ARCH).changes
 
@@ -29,7 +29,7 @@ srpm: $(SRPM_FILE)
 
 $(SRPM_FILE):
 	mkdir -vp $(BUILDDIR)/rpmbuild/{SOURCES,SPECS,BUILD,SRPMS,RPMS}
-	mkdir -vp $(shell dirname $(SRPM_FILE))
+	mkdir -vp $(BUILDDIR)/results/SRPMS
 
 	# prepare and build silicon-toolkit
 	tar --exclude-vcs -czf $(BUILDDIR)/rpmbuild/SOURCES/$(shell basename $(TARBALL_FILE)) -C $(shell dirname $(CURDIR)) --transform s/^$(shell basename $(CURDIR))/silicon-toolkit/ $(shell basename $(CURDIR))
@@ -43,10 +43,13 @@ $(SRPM_FILE):
 	cd $(BUILDDIR)/rpmbuild/SOURCES && source $(CURDIR)/dependency/rpmbuild/SOURCES/prep_sources.sh
 	cp dependency/rpmbuild/SPECS/perl-Capture-Tiny.spec $(BUILDDIR)/rpmbuild/SPECS/
 	cp dependency/rpmbuild/SPECS/perl-Proc-Pidfile.spec $(BUILDDIR)/rpmbuild/SPECS/
+	cp dependency/rpmbuild/SPECS/perl-Text-Table+Aligner.spec $(BUILDDIR)/rpmbuild/SPECS/
 	sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' $(BUILDDIR)/rpmbuild/SPECS/perl-Capture-Tiny.spec
 	sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' $(BUILDDIR)/rpmbuild/SPECS/perl-Proc-Pidfile.spec
-	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" --define 'dist %{nil}' $(BUILDDIR)/rpmbuild/SPECS/perl-Capture-Tiny.spec
-	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" --define 'dist %{nil}' $(BUILDDIR)/rpmbuild/SPECS/perl-Proc-Pidfile.spec
+	sed -i '/^\s*Requires:\s*perl(:MODULE_COMPAT_/d' $(BUILDDIR)/rpmbuild/SPECS/perl-Text-Table+Aligner.spec
+	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" $(BUILDDIR)/rpmbuild/SPECS/perl-Capture-Tiny.spec
+	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" $(BUILDDIR)/rpmbuild/SPECS/perl-Proc-Pidfile.spec
+	rpmbuild -bs --define "debug_package %{nil}" --define "_topdir $(BUILDDIR)/rpmbuild" $(BUILDDIR)/rpmbuild/SPECS/perl-Text-Table+Aligner.spec
 
 	for srpm_file in $(SRPM_FILE); do \
 		mv $(BUILDDIR)/rpmbuild/SRPMS/$$(basename $${srpm_file}) $${srpm_file}; \
@@ -59,7 +62,7 @@ $(RPM_FILES): $(SRPM_FILE)
 	mkdir -vp $(BUILDDIR)/mock
 
 	for srpm_file in $(SRPM_FILE); do \
-		mock -r oraclelinux-7-$(ARCH) --resultdir $(BUILDDIR)/mock --define 'dist %{nil}' --rebuild $${srpm_file}; \
+		mock -r centos-6-$(ARCH) --resultdir $(BUILDDIR)/mock --rebuild $${srpm_file}; \
 	done
 
 	for rpm_file in $(RPM_FILES); do \
