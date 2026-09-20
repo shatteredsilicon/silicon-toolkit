@@ -406,8 +406,8 @@ sub main {
   if (!defined $userstat_row) {
     die "This tool only works on Percona MySQL and MariaDB, which have the User Statistics (userstat) plugin";
   }
-  if (!$userstat_row->[1]) {
-    die "'userstat' must be set 1 for this tool to work";
+  if (!$db->is_true($userstat_row->[1])) {
+    die "'userstat' must be set to true for this tool to work";
   }
 
   my $uptime;
@@ -426,10 +426,10 @@ sub main {
   }
 
   my $sql = "
-SELECT    statistics.table_schema,
-          statistics.table_name,
-          statistics.index_name,
-          index_statistics.rows_read
+SELECT    statistics.table_schema as table_schema,
+          statistics.table_name as table_name,
+          statistics.index_name as index_name,
+          SUM(index_statistics.rows_read) as rows_read
 FROM		  information_schema.statistics
 LEFT JOIN	information_schema.index_statistics ON
             statistics.table_schema = index_statistics.table_schema AND
@@ -529,11 +529,11 @@ GROUP BY	statistics.table_schema,
 
   if (!$show_usage_for_all_indexes) {
     $sql = "$sql
-HAVING  index_statistics.rows_read IS NULL";
+HAVING  rows_read IS NULL";
   } else {
     $sql = "$sql
-ORDER BY	index_statistics.rows_read,
-		      statistics.table_name";
+ORDER BY	rows_read,
+		      table_name";
   }
 
   STDEBUG && print "structured sql -> $sql\n";
