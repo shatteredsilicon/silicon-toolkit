@@ -38,50 +38,65 @@ use Config::IniFiles;
 use constant STDEBUG => $ENV{STDEBUG} || 0;
 
 sub new {
-  my ( $class, $opt_str ) = @_;
+  my ( $class ) = @_;
 
-  my %options = (
-    "user|u=s" => \my $user,
-    "password|p=s" => \my $password,
-    "host|h=s" => \my $host,
-    "socket|S=s" => \my $socket,
-    "port|P=i" => \(my $port = 3306),
-    "database|D=s" => \my $database,
-    "charset|A=s" => \my $charset,
-    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
-    "ask-pass" => \my $ask_pass,
-    "verbose" => \my $verbose,
-    "help" => \my $help
+  my %defaults = (
+    port => 3306
   );
-  GetOptions(
-    %options
-  ) or pod2usage(-verbose => 1);
-  pod2usage(1) if $help;
 
-  my %args = ();
-  foreach my $arg_key ( keys %options ) {
-    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
-    my @names = split(/\|/, $name_str[0]);
-    my $primary_name = $names[0];
-    $args{$primary_name} = ${$options{$arg_key}};
-  }
+  my @possible_options = (
+    "user|u=s",
+    "password|p=s",
+    "host|h=s",
+    "socket|S=s",
+    "port|P=i",
+    "database|D=s",
+    "charset|A=s",
+    "mysql-read-default-file|F=s",
+    "ask-pass",
+    "verbose",
+    "help",
+    "config=s"
+  );
+
+  my %options = ();
+  GetOptions(
+    \%options,
+    @possible_options
+  ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $options{help};
+
+  my %args = (%defaults, %options);
   my $self = {
+    defaults => \%defaults,
+    possible_options => \@possible_options,
+    options => \%options,
     args => \%args
   };
 
-  if (defined $opt_str) {
-    foreach my $opt ( split(qr/(?<!\\),/, $opt_str) ) {
+  if (defined $args{config}) {
+    read_config_file($self, $args{config});
+  }
+
+  if ((scalar @ARGV) > 0) {
+    foreach my $opt ( split(qr/(?<!\\),/, $ARGV[0]) ) {
       $opt =~ s/\\,/,/g;
       if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
         STDEBUG && print "key: $opt_key, val: $opt_val\n";
-        foreach my $arg_key ( keys %options ) {
+        foreach my $arg_key ( @possible_options ) {
           my @name_str = split(/(=|\+|\!|:)/, $arg_key);
           my @names = split(/\|/, $name_str[0]);
           my $primary_name = $names[0];
 
           foreach my $name (@names[1..$#names]) {
             if ($name eq $opt_key) {
-              $self->{args}->{$primary_name} = $opt_val;
+              if (ref($self->{args}->{$primary_name}) eq 'ARRAY') {
+                push(@{$self->{args}->{$primary_name}}, $opt_val);
+              } elsif (!defined $self->{args}->{$primary_name} && $arg_key =~ /\@$/) {
+                $self->{args}->{$primary_name} = [ $opt_val ];
+              } else {
+                $self->{args}->{$primary_name} = $opt_val;
+              }
               last;
             }
           }
@@ -183,6 +198,45 @@ sub parse_dsn {
   }
 
   STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+sub read_config_file {
+  my ($self, $config_file) = @_;
+
+  if (! -e "$config_file") {
+    die "Config file '$config_file' doesn't exists\n";
+  }
+  if (! -r "$config_file") {
+    die "Can't read config file '$config_file'\n";
+  }
+
+  my $section = 'ALL';
+
+  my $fixed_options = { -fallback => $section };
+  if ( $Config::IniFiles::VERSION >= '3.0' ) { # -php_compat was added in v3.0+
+    $fixed_options->{ -php_compat } = 1;
+  }
+
+  my %options = %$fixed_options;
+  $options{ -file } = $config_file;
+  my $cfg = Config::IniFiles->new( %options );
+
+  if (! defined $cfg) {
+    die "Can't parse config file '$config_file': " . join("\n", @Config::IniFiles::errors);
+  }
+
+  foreach my $arg_key ( @{$self->{possible_options}} ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+
+    next if defined $self->{options}->{$primary_name}; # cli argument has higher priority
+
+    my $value = $cfg->val($section, $primary_name);
+    if (defined $value) {
+      $self->{args}->{$primary_name} = $value;
+    }
+  }
 }
 
 # ############################################################################
@@ -346,9 +400,7 @@ my @global_table_header = (\'| ', 'Setting', \' | ', +{title=>'Value', align=>'r
 my @total_table_header = (\'| ', 'Allocations', \' | ', +{title=>'Value', align=>'right', align_title=>'right'}, \' |');
 
 sub main {
-  my @ARGV = @_;
-
-  my $o = new Option(shift @ARGV);
+  my $o = new Option();
   $o->parse_dsn();
 
   my $database = $o->get_option('database');
@@ -609,6 +661,12 @@ Server listen port.
 type: boolean
 
 Prompt for a password when connecting to MySQL.
+
+=item B<--config>
+
+type: string
+
+Config file to read key=value options from.
 
 =item B<--verbose>
 

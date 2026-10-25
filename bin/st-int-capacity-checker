@@ -40,49 +40,56 @@ use constant STDEBUG => $ENV{STDEBUG} || 0;
 sub new {
   my ( $class ) = @_;
 
-  my %options = (
-    "user|u=s" => \my $user,
-    "password|p=s" => \my $password,
-    "host|h=s" => \my $host,
-    "socket|S=s" => \my $socket,
-    "port|P=i" => \(my $port = 3306),
-    "database|D=s" => \my $database,
-    "charset|A=s" => \my $charset,
-    "tables|t=s" => \my @tables,
-    "mysql-read-default-file|F=s" => \my $mysql_read_default_file,
-    "ask-pass" => \my $ask_password,
-    "threshold=i" => \(my $threshold = 80),
-    "schema=s" => \my $schema,
-    "verbose" => \my $verbose,
-    "parallel=i" => \(my $parallel = 1),
-    "fast-auto-increment-only|fast" => \my $fast,
-    "help" => \my $help
+  my %defaults = (
+    port => 3306,
+    threshold => 80,
+    parallel => 1
   );
-  GetOptions(
-    %options
-  ) or pod2usage(-verbose => 1);
-  pod2usage(1) if $help;
 
-  my %args = ();
-  foreach my $arg_key ( keys %options ) {
-    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
-    my @names = split(/\|/, $name_str[0]);
-    my $primary_name = $names[0];
-    if (ref($options{$arg_key}) eq 'ARRAY') {
-      $args{$primary_name} = $options{$arg_key}
-    } else {
-      $args{$primary_name} = ${$options{$arg_key}};
-    }
-  }
+  my @possible_options = (
+    "user|u=s",
+    "password|p=s",
+    "host|h=s",
+    "socket|S=s",
+    "port|P=i",
+    "database|D=s",
+    "charset|A=s",
+    "tables|t=s@",
+    "mysql-read-default-file|F=s",
+    "ask-pass",
+    "threshold=i",
+    "schema=s",
+    "verbose",
+    "parallel=i",
+    "fast-auto-increment-only|fast",
+    "help",
+    "config=s"
+  );
+
+  my %options = ();
+  GetOptions(
+    \%options,
+    @possible_options
+  ) or pod2usage(-verbose => 1);
+  pod2usage(1) if $options{help};
+
+  my %args = (%defaults, %options);
   my $self = {
+    defaults => \%defaults,
+    possible_options => \@possible_options,
+    options => \%options,
     args => \%args
   };
+
+  if (defined $args{config}) {
+    read_config_file($self, $args{config});
+  }
 
   if ((scalar @ARGV) > 0) {
     foreach my $opt ( split(qr/(?<!\\),/, $ARGV[0]) ) {
       $opt =~ s/\\,/,/g;
       if ( my ($opt_key, $opt_val) = $opt =~  m/^(.)=(.*)$/ ) {
-        foreach my $arg_key ( keys %options ) {
+        foreach my $arg_key ( @possible_options ) {
           my @name_str = split(/(=|\+|\!|:)/, $arg_key);
           my @names = split(/\|/, $name_str[0]);
           my $primary_name = $names[0];
@@ -91,6 +98,8 @@ sub new {
             if ($name eq $opt_key) {
               if (ref($self->{args}->{$primary_name}) eq 'ARRAY') {
                 push(@{$self->{args}->{$primary_name}}, $opt_val);
+              } elsif (!defined $self->{args}->{$primary_name} && $arg_key =~ /\@$/) {
+                $self->{args}->{$primary_name} = [ $opt_val ];
               } else {
                 $self->{args}->{$primary_name} = $opt_val;
               }
@@ -102,9 +111,9 @@ sub new {
     }
   }
 
-  if ( (scalar @tables) > 0 ) {
-    my $tbls = \@tables;
-    $tbls = [ split(/,/,join(',',@tables)) ];
+  if ( defined $args{tables} && (scalar @{$args{tables}}) > 0 ) {
+    my $tbls = $args{tables};
+    $tbls = [ split(/,/,join(',', @{$args{tables}})) ];
   };
 
   STDEBUG && print "args: " . Dumper($self->{args});
@@ -201,6 +210,45 @@ sub parse_dsn {
   }
 
   STDEBUG && print "args: " . Dumper($self->{args});
+}
+
+sub read_config_file {
+  my ($self, $config_file) = @_;
+
+  if (! -e "$config_file") {
+    die "Config file '$config_file' doesn't exists\n";
+  }
+  if (! -r "$config_file") {
+    die "Can't read config file '$config_file'\n";
+  }
+
+  my $section = 'ALL';
+
+  my $fixed_options = { -fallback => $section };
+  if ( $Config::IniFiles::VERSION >= '3.0' ) { # -php_compat was added in v3.0+
+    $fixed_options->{ -php_compat } = 1;
+  }
+
+  my %options = %$fixed_options;
+  $options{ -file } = $config_file;
+  my $cfg = Config::IniFiles->new( %options );
+
+  if (! defined $cfg) {
+    die "Can't parse config file '$config_file': " . join("\n", @Config::IniFiles::errors);
+  }
+
+  foreach my $arg_key ( @{$self->{possible_options}} ) {
+    my @name_str = split(/(=|\+|\!|:)/, $arg_key);
+    my @names = split(/\|/, $name_str[0]);
+    my $primary_name = $names[0];
+
+    next if defined $self->{options}->{$primary_name}; # cli argument has higher priority
+
+    my $value = $cfg->val($section, $primary_name);
+    if (defined $value) {
+      $self->{args}->{$primary_name} = $value;
+    }
+  }
 }
 
 # ############################################################################
@@ -654,6 +702,12 @@ Server listen port.
 type: boolean
 
 Prompt for a password when connecting to MySQL.
+
+=item B<--config>
+
+type: string
+
+Config file to read key=value options from.
 
 =item B<--verbose>
 
