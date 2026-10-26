@@ -808,7 +808,7 @@ sub get_cxn_params {
       $dsn = 'DBI:mysql:' . ( $info->{D} || '' ) . ';'
          . join(';', map  { "$opts{$_}->{dsn}=$info->{$_}" }
                      grep { defined $info->{$_} }
-                     qw(F h P S A))
+                     qw(F h P S A s))
          . ';mysql_read_default_group=client'
          . ($info->{L} ? ';mysql_local_infile=1' : '');
    }
@@ -4195,6 +4195,12 @@ type: string; default: fk
 
 Check for duplicate f=foreign keys, k=keys or fk=both.
 
+=item --mysql_ssl
+
+short form: -s; type: int
+
+Create SSL MySQL connection.
+
 =item --password
 
 short form: -p; type: string
@@ -4346,6 +4352,12 @@ Socket file to use for connection.
 dsn: user; copy: yes
 
 User for login if not current user.
+
+=item * s
+
+dsn: mysql_ssl; copy: yes
+
+Create SSL connection
 
 =back
 

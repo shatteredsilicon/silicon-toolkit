@@ -50,6 +50,7 @@ sub new {
     "host|h=s",
     "socket|S=s",
     "port|P=i",
+    "mysql-ssl|s",
     "database|D=s",
     "charset|A=s",
     "mysql-read-default-file|F=s",
@@ -283,7 +284,7 @@ sub new {
         . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
   }
 
-  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file});
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{database}, $args{charset}, $args{mysql_read_default_file}, $args{ssl});
   if ($dsn =~ m/DBI:MariaDB/) {
     delete $defaults->{mysql_enable_utf8};
   }
@@ -332,7 +333,7 @@ sub new {
 }
 
 sub get_dbi_dsn {
-  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file ) = @_;
+  my ( $host, $port, $socket, $database, $charset, $mysql_read_default_file, $ssl ) = @_;
 
   if (!$host && !$socket) {
     return undef;
@@ -340,13 +341,16 @@ sub get_dbi_dsn {
 
   my $dsn;
   my $socket_opt;
+  my $ssl_opt;
   eval{ require DBD::MariaDB };
   if ($@) {
     $dsn = "DBI:mysql:mysql_auto_reconnect=1";
     $socket_opt = 'socket';
+    $ssl_opt = 'mysql_ssl';
   } else {
     $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
     $socket_opt = 'mariadb_socket';
+    $ssl_opt = 'mariadb_ssl';
   };
 
   if (defined $socket && $socket ne '') {
@@ -365,6 +369,10 @@ sub get_dbi_dsn {
 
   if (defined $mysql_read_default_file && $mysql_read_default_file ne '') {
     $dsn = "${dsn};mysql_read_default_file=${mysql_read_default_file}";
+  }
+
+  if ($ssl) {
+    $dsn = "${dsn};${ssl_opt}=1"
   }
 
   return $dsn;
@@ -481,7 +489,8 @@ sub main {
     password => $password,
     database => $database,
     charset => $o->get_option('charset'),
-    mysql_read_default_file => $o->get_option('mysql-read-default-file')
+    mysql_read_default_file => $o->get_option('mysql-read-default-file'),
+    ssl => $o->get_option('mysql-ssl')
   );
 
   my $verbose = $o->get_option('verbose');
@@ -1060,6 +1069,12 @@ short form: -P; type: integer
 
 Server listen port.
 
+=item B<--mysql-ssl>
+
+short form: -s; type: boolean
+
+Create MySQL SSL connection.
+
 =item B<--ask-pass>
 
 type: boolean
@@ -1150,6 +1165,10 @@ If password contains commas they must be escaped with a backslash: "exam\,ple"
 =item * P
 
 Port number to use for connection.
+
+=item * s
+
+Create MySQL SSL connection.
 
 =item * S
 

@@ -60,6 +60,7 @@ sub new {
     "host|h=s",
     "socket|S=s",
     "port|P=i",
+    "mysql-ssl|s",
     "tmp-dir=s",
     "master-info-file",
     "mysql-cli=s",
@@ -322,7 +323,7 @@ sub new {
         . "  OpenSolaris    pgk install pkg:/SUNWpmdbi\n";
   }
 
-  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket});
+  my $dsn = get_dbi_dsn($args{host}, $args{port}, $args{socket}, $args{ssl});
   if ($dsn =~ m/DBI:MariaDB/) {
     delete $defaults->{mysql_enable_utf8};
   }
@@ -371,7 +372,7 @@ sub new {
 }
 
 sub get_dbi_dsn {
-  my ( $host, $port, $socket ) = @_;
+  my ( $host, $port, $socket, $ssl ) = @_;
 
   if (!$host && !$socket) {
     return undef;
@@ -379,19 +380,26 @@ sub get_dbi_dsn {
 
   my $dsn;
   my $socket_opt;
+  my $ssl_opt;
   eval{ require DBD::MariaDB };
   if ($@) {
     $dsn = "DBI:mysql:mysql_auto_reconnect=1";
     $socket_opt = 'socket';
+    $ssl_opt = 'mysql_ssl';
   } else {
     $dsn = "DBI:MariaDB:mariadb_auto_reconnect=1";
     $socket_opt = 'mariadb_socket';
+    $ssl_opt = 'mariadb_ssl';
   };
 
   if ($socket) {
     $dsn = "${dsn};${socket_opt}=${socket};";
   } else {
     $dsn = "${dsn};port=${port};host=${host};";
+  }
+
+  if ($ssl) {
+    $dsn = "${dsn};${ssl_opt}=1"
   }
 
   return $dsn;
@@ -452,6 +460,7 @@ sub main {
     socket => $o->get_option('socket'),
     user => $o->get_option('user'),
     password => $o->get_option('password'),
+    ssl => $o->get_option('mysql-ssl')
   );
 
   my $channel_name = $o->get_option('channel-name');
@@ -1182,6 +1191,12 @@ The socket file to use for connection.
 short form: -P; type: integer
 
 Server listen port.
+
+=item B<--mysql-ssl>
+
+short form: -s; type: boolean
+
+Create MySQL SSL connection.
 
 =item B<--tmp-dir>
 
